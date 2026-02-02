@@ -185,7 +185,35 @@ async function startCrawlerContainer(job) {
     
     if (isECRImage || (image_url.includes('.') && !isLocalImage)) {
       console.log(`📥 Pulling latest image from ECR: ${image_url}`);
+      
+      // For ECR images, we need to force pull to ensure we get the latest version
+      // Docker's default behavior with :latest may use cached image
+      // Solution: Remove local image first, then pull (ensures fresh pull)
       try {
+        // Check if image exists locally
+        let localImage = null;
+        try {
+          const images = await docker.listImages();
+          localImage = images.find(img => 
+            img.RepoTags && img.RepoTags.some(tag => tag === image_url || tag.startsWith(image_url.split(':')[0] + ':'))
+          );
+        } catch (checkError) {
+          console.warn(`⚠️ Could not check for local image:`, checkError.message);
+        }
+        
+        // If local image exists, remove it to force fresh pull
+        if (localImage) {
+          console.log(`🔄 Removing cached image to force fresh pull...`);
+          try {
+            await docker.getImage(image_url).remove();
+            console.log(`✅ Cached image removed`);
+          } catch (removeError) {
+            // Image might be in use or already removed, continue anyway
+            console.log(`ℹ️  Could not remove cached image (may be in use):`, removeError.message);
+          }
+        }
+        
+        // Now pull the latest image (will always fetch from registry)
         await new Promise((resolve, reject) => {
           docker.pull(image_url, (err, stream) => {
             if (err) return reject(err);
