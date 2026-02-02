@@ -177,21 +177,14 @@ async function startCrawlerContainer(job) {
   console.log(`   Image: ${image_url}`);
 
   try {
-    // Check if image exists locally first
-    let imageExists = false;
-    try {
-      const images = await docker.listImages();
-      imageExists = images.some(img => 
-        img.RepoTags && img.RepoTags.some(tag => tag === image_url || tag.includes(image_url.split(':')[0]))
-      );
-    } catch (error) {
-      console.warn(`⚠️ Could not check for local image:`, error.message);
-    }
+    // ALWAYS pull the latest image from ECR before starting container
+    // This ensures we're always using the most up-to-date code
+    // Skip only for local images (localhost or no registry prefix)
+    const isECRImage = image_url.includes('.dkr.ecr.') || image_url.includes('amazonaws.com');
+    const isLocalImage = image_url.includes('localhost') || (!image_url.includes('.') && !image_url.includes('/'));
     
-    // Pull image if not found locally (skip for local images without registry prefix)
-    // ECR repositories are public - no authentication required
-    if (!imageExists && !image_url.includes('localhost') && image_url.includes('.')) {
-      console.log(`📥 Pulling image: ${image_url}`);
+    if (isECRImage || (image_url.includes('.') && !isLocalImage)) {
+      console.log(`📥 Pulling latest image from ECR: ${image_url}`);
       try {
         await new Promise((resolve, reject) => {
           docker.pull(image_url, (err, stream) => {
@@ -199,17 +192,17 @@ async function startCrawlerContainer(job) {
             
             docker.modem.followProgress(stream, (err, output) => {
               if (err) return reject(err);
-              console.log(`✅ Image pulled successfully`);
+              console.log(`✅ Latest image pulled successfully`);
               resolve();
             });
           });
         });
       } catch (pullError) {
-        console.warn(`⚠️ Failed to pull image, trying to use local image:`, pullError.message);
-        // Continue - might be a local image
+        console.warn(`⚠️ Failed to pull latest image, will try to use existing:`, pullError.message);
+        // Continue - might be a network issue, but try to use existing image
       }
-    } else if (imageExists) {
-      console.log(`✅ Using local image: ${image_url}`);
+    } else if (isLocalImage) {
+      console.log(`ℹ️  Using local image (not from ECR): ${image_url}`);
     } else {
       console.log(`ℹ️  Using image: ${image_url} (assuming local or already pulled)`);
     }
