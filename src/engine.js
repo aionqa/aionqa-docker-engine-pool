@@ -13,6 +13,7 @@ import { randomUUID } from 'crypto';
 // In Docker Compose, services are resolved by service name, not container name
 const BACKEND_URL = process.env.BACKEND_URL || 'http://back:4000';
 const ENGINE_TOKEN = process.env.ENGINE_TOKEN; // Token for authenticating with backend
+const SERVICE_KEY = process.env.SERVICE_KEY; // Optional service key for image URL retrieval
 const ENGINE_ID = process.env.ENGINE_ID || `docker-engine-${hostname()}-${randomUUID().substring(0, 8)}`;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '5000'); // 5 seconds
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
@@ -20,12 +21,15 @@ const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 // ECR repositories are public - no AWS credentials needed
 // Helper uses ENGINE_TOKEN (project credentials) for backend authentication only
 
-// Validate engine token
+// Validate engine token (required for job polling)
 if (!ENGINE_TOKEN) {
   console.error('❌ ENGINE_TOKEN environment variable is required');
   console.error('    Generate a token in the UI: Settings > Docker Engines > Generate Token');
   process.exit(1);
 }
+
+// SERVICE_KEY is optional - if provided, will request image URL from backend
+// If not provided, image URL comes from job response
 
 console.log(`🐳 Docker Engine ID: ${ENGINE_ID}`);
 console.log(`🔗 Backend URL: ${BACKEND_URL}`);
@@ -45,6 +49,55 @@ function getAuthHeaders() {
   return {
     'Authorization': `Bearer ${ENGINE_TOKEN}`
   };
+}
+
+/**
+ * Get axios headers with service key authentication
+ */
+function getServiceKeyHeaders() {
+  if (!SERVICE_KEY) {
+    return null;
+  }
+  return {
+    'Authorization': `Bearer ${SERVICE_KEY}`
+  };
+}
+
+/**
+ * Get crawler image URL from backend using service key
+ * Falls back to image_url from job if service key not available
+ */
+async function getCrawlerImageUrl() {
+  // If no service key, return null (will use image_url from job)
+  if (!SERVICE_KEY) {
+    return null;
+  }
+  
+  try {
+    const headers = getServiceKeyHeaders();
+    if (!headers) {
+      return null;
+    }
+    
+    console.log(`📥 Requesting crawler image URL from backend...`);
+    const response = await axios.get(
+      `${BACKEND_URL}/api/service/crawler-image`,
+      {
+        headers,
+        timeout: 10000
+      }
+    );
+    
+    if (response.data && response.data.image_url) {
+      console.log(`✅ Got crawler image URL from backend: ${response.data.image_url}`);
+      return response.data.image_url;
+    }
+    
+    return null;
+  } catch (error) {
+    console.warn(`⚠️ Failed to get image URL from backend, will use job image_url:`, error.message);
+    return null;
+  }
 }
 
 /**
@@ -163,7 +216,7 @@ async function startCrawlerContainer(job) {
   const {
     job_id,
     job_type, // Get job_type from backend response
-    image_url,
+    image_url: jobImageUrl, // Image URL from job (may be overridden)
     environment_vars,
     runner_token,
     backend_url
@@ -172,6 +225,18 @@ async function startCrawlerContainer(job) {
   // ECR repositories are public - no authentication required
   // Helper uses ENGINE_TOKEN (project credentials) for backend authentication only
   // No AWS credentials needed for image pulls
+  
+  // Get image URL - prefer service key endpoint, fallback to job image_url
+  let image_url = jobImageUrl;
+  if (SERVICE_KEY) {
+    const serviceImageUrl = await getCrawlerImageUrl();
+    if (serviceImageUrl) {
+      image_url = serviceImageUrl;
+      console.log(`📥 Using image URL from service endpoint: ${image_url}`);
+    } else {
+      console.log(`ℹ️  Service key available but failed to get image URL, using job image_url: ${image_url}`);
+    }
+  }
 
   console.log(`🚀 Starting container for job ${job_id}`);
   console.log(`   Image: ${image_url}`);
