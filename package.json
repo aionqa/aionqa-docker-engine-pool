@@ -1,0 +1,30 @@
+{
+  "name": "docker-engine-pool",
+  "version": "1.0.0",
+  "description": "Docker engine pool manager for remote crawling execution",
+  "type": "module",
+  "main": "src/engine.js",
+  "scripts": {
+    "start": "node src/engine.js",
+    "dev": "node --watch src/engine.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dockerode": "^4.0.0"
+  },
+  "keywords": [
+    "docker",
+    "runner",
+    "crawler",
+    "pool"
+  ],
+  "author": "AionQA Team",
+  "license": "MIT"
+}
+
+
+
+
+
+
+
