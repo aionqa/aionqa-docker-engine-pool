@@ -304,7 +304,6 @@ async function startCrawlerContainer(job) {
     // Build environment variables - match localDockerTaskService.js configuration
     // AI_SERVICE_URL is configurable via helper environment or defaults to docker-compose service name
     const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://aionqa-ai-service:5000';
-    const aiServiceToken = process.env.AI_SERVICE_TOKEN || '';
     const containerEnv = [
       `JOB_ID=${job_id}`,
       `JOB_TYPE=${job_type || (job.job_type || (job.type === 'login' ? 'login' : 'crawl'))}`, // CRITICAL: Pass job type explicitly
@@ -314,7 +313,8 @@ async function startCrawlerContainer(job) {
       `RUNNER_TYPE=service-managed`, // Mark as service-managed crawler
       `RUNNER_ID=container-${job_id}`,
       `AI_SERVICE_URL=${aiServiceUrl}`, // AI service URL (no OpenAI key needed in crawler)
-      `AI_SERVICE_TOKEN=${aiServiceToken}`, // AI service token for authentication
+      // CRITICAL: AI_SERVICE_TOKEN must NOT be passed to crawlers for security
+      // Crawlers authenticate to AI service via RUNNER_TOKEN or other method
       `POLL_INTERVAL=3000`,
       `NODE_ENV=${process.env.NODE_ENV || 'development'}`,
       ...Object.entries(environment_vars || {}).map(([key, value]) => `${key}=${value}`)
