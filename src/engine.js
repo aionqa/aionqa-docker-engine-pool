@@ -280,16 +280,24 @@ async function startCrawlerContainer(job) {
   // Helper uses ENGINE_TOKEN (project credentials) for backend authentication only
   // No AWS credentials needed for image pulls
   
-  // Get image URL - prefer service key endpoint, fallback to job image_url
+  // Get full ECR image URL from backend if needed
   let image_url = jobImageUrl;
-  if (SERVICE_KEY) {
-    const serviceImageUrl = await getCrawlerImageUrl();
-    if (serviceImageUrl) {
-      image_url = serviceImageUrl;
-      console.log(`📥 Using image URL from service endpoint: ${image_url}`);
+  let requiresAuth = true;
+  
+  // If image_url is a local name (not full ECR URL), resolve it via backend
+  if (!image_url.includes('.dkr.ecr.') && !image_url.includes('amazonaws.com')) {
+    console.log(`📥 Resolving image URL from backend: ${image_url}`);
+    const imageUrlData = await getImageUrlFromBackend(image_url);
+    if (imageUrlData && imageUrlData.image_url) {
+      image_url = imageUrlData.image_url;
+      requiresAuth = imageUrlData.requires_auth !== false;
+      console.log(`✅ Resolved to: ${image_url} (auth: ${requiresAuth ? 'required' : 'public'})`);
     } else {
-      console.log(`ℹ️  Service key available but failed to get image URL, using job image_url: ${image_url}`);
+      console.warn(`⚠️ Failed to resolve image URL, will try to use: ${image_url}`);
     }
+  } else {
+    // Already full ECR URL
+    requiresAuth = !image_url.includes('aionqa-runner'); // Helper images are public
   }
 
   console.log(`🚀 Starting container for job ${job_id}`);
@@ -298,55 +306,53 @@ async function startCrawlerContainer(job) {
   try {
     // ALWAYS pull the latest image from ECR before starting container
     // This ensures we're always using the most up-to-date code
-    // Skip only for local images (localhost or no registry prefix)
     const isECRImage = image_url.includes('.dkr.ecr.') || image_url.includes('amazonaws.com');
     const isLocalImage = image_url.includes('localhost') || (!image_url.includes('.') && !image_url.includes('/'));
     
-    if (isECRImage || (image_url.includes('.') && !isLocalImage)) {
+    if (isECRImage) {
+      // Get ECR token if authentication is required
+      if (requiresAuth) {
+        const tokenData = await getECRPullToken();
+        if (tokenData) {
+          await authenticateECR(tokenData);
+        } else {
+          console.warn(`⚠️ Could not get ECR token, will try to pull anyway (may fail for private repos)`);
+        }
+      } else {
+        console.log(`ℹ️  Image is public, no authentication needed`);
+      }
+      
       console.log(`📥 Pulling latest image from ECR: ${image_url}`);
       
-      // For ECR images, we need to force pull to ensure we get the latest version
-      // Docker's default behavior with :latest may use cached image
-      // Solution: Remove local image first, then pull (ensures fresh pull)
+      // Pull the latest image (Docker will use cache if up-to-date)
       try {
-        // Check if image exists locally
-        let localImage = null;
-        try {
-          const images = await docker.listImages();
-          localImage = images.find(img => 
-            img.RepoTags && img.RepoTags.some(tag => tag === image_url || tag.startsWith(image_url.split(':')[0] + ':'))
-          );
-        } catch (checkError) {
-          console.warn(`⚠️ Could not check for local image:`, checkError.message);
-        }
-        
-        // If local image exists, remove it to force fresh pull
-        if (localImage) {
-          console.log(`🔄 Removing cached image to force fresh pull...`);
-          try {
-            await docker.getImage(image_url).remove();
-            console.log(`✅ Cached image removed`);
-          } catch (removeError) {
-            // Image might be in use or already removed, continue anyway
-            console.log(`ℹ️  Could not remove cached image (may be in use):`, removeError.message);
-          }
-        }
-        
-        // Now pull the latest image (will always fetch from registry)
         await new Promise((resolve, reject) => {
           docker.pull(image_url, (err, stream) => {
             if (err) return reject(err);
             
             docker.modem.followProgress(stream, (err, output) => {
               if (err) return reject(err);
-              console.log(`✅ Latest image pulled successfully`);
+              console.log(`✅ Image pulled successfully`);
               resolve();
             });
           });
         });
       } catch (pullError) {
-        console.warn(`⚠️ Failed to pull latest image, will try to use existing:`, pullError.message);
-        // Continue - might be a network issue, but try to use existing image
+        console.error(`❌ Failed to pull image: ${pullError.message}`);
+        // Check if image exists locally as fallback
+        try {
+          const images = await docker.listImages();
+          const localImage = images.find(img => 
+            img.RepoTags && img.RepoTags.some(tag => tag === image_url || tag.startsWith(image_url.split(':')[0] + ':'))
+          );
+          if (localImage) {
+            console.warn(`⚠️ Using cached image (pull failed but image exists locally)`);
+          } else {
+            throw pullError; // Re-throw if no local image
+          }
+        } catch {
+          throw pullError; // Re-throw if can't check or no local image
+        }
       }
     } else if (isLocalImage) {
       console.log(`ℹ️  Using local image (not from ECR): ${image_url}`);
