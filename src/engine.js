@@ -635,24 +635,8 @@ async function main() {
   // Cleanup containers every 5 minutes
   setInterval(cleanupContainers, 5 * 60 * 1000);
   
-  // Check for helper image updates on startup
-  console.log(`🔄 Checking for helper image updates on startup...`);
-  const startupUpdate = await checkAndUpdateHelperImage();
-  if (startupUpdate) {
-    console.log(`🆕 New helper image detected on startup. Restarting...`);
-    await restartHelperContainer();
-    return; // Exit to allow restart
-  }
-  
-  // Check for helper image updates every 12 hours
-  setInterval(async () => {
-    console.log(`🔄 Periodic check for helper image updates (every 12 hours)...`);
-    const hasUpdate = await checkAndUpdateHelperImage();
-    if (hasUpdate) {
-      console.log(`🆕 New helper image detected. Restarting...`);
-      await restartHelperContainer();
-    }
-  }, IMAGE_UPDATE_INTERVAL);
+  // Helper image updates are handled externally (docker-compose, k8s, etc.)
+  // No need to check for updates here
 
   // Main polling loop
   let pollCount = 0;
