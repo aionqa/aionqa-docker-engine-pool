@@ -17,6 +17,11 @@ const SERVICE_KEY = process.env.SERVICE_KEY; // Optional service key for image U
 const ENGINE_ID = process.env.ENGINE_ID || `docker-engine-${hostname()}-${randomUUID().substring(0, 8)}`;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '5000'); // 5 seconds
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
+const IMAGE_UPDATE_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours in milliseconds
+const HELPER_IMAGE_NAME = process.env.HELPER_IMAGE_NAME || 'aionqa-docker-engine-pool';
+const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || '778954507986';
+const AWS_REGION = process.env.AWS_REGION || 'ap-southeast-2';
+const HELPER_ECR_IMAGE = `${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${HELPER_IMAGE_NAME}:latest`;
 
 // ECR repositories are public - no AWS credentials needed
 // Helper uses ENGINE_TOKEN (project credentials) for backend authentication only
