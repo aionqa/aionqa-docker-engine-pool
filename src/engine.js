@@ -415,12 +415,16 @@ async function startCrawlerContainer(job) {
             console.log(`📦 Constructed ECR URL: ${ecrUrl}`);
           }
           
-          // Get ECR token if needed
-          if (requiresAuth) {
-            const tokenData = await getECRPullToken();
-            if (tokenData) {
-              await authenticateECR(tokenData);
-            }
+          // ECR requires authentication for ALL repositories (even public ones)
+          // Always authenticate before pulling from ECR
+          console.log(`🔑 Authenticating with ECR before pulling fallback image...`);
+          const tokenData = await getECRPullToken();
+          if (tokenData) {
+            await authenticateECR(tokenData);
+            console.log(`✅ ECR authentication successful`);
+          } else {
+            console.error(`❌ Failed to get ECR token from backend - cannot pull image without authentication`);
+            throw new Error(`ECR authentication failed: backend returned error when requesting token`);
           }
           
           // Try to pull from ECR
