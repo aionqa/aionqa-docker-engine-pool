@@ -96,32 +96,26 @@ async function getECRPullToken(imageUrl = null) {
 }
 
 /**
- * Authenticate Docker with ECR using temporary token
+ * Get ECR auth config for Dockerode
+ * Returns auth config object to pass to docker.pull()
  */
-async function authenticateECR(tokenData) {
+function getECRAuthConfig(tokenData) {
   if (!tokenData || !tokenData.token || !tokenData.registry) {
-    return false;
+    throw new Error('Missing registry or token for ECR authentication');
   }
   
-  try {
-    console.log(`🔐 Authenticating Docker with ECR registry: ${tokenData.registry}`);
-    
-    // Use dockerode to authenticate
-    // Note: dockerode doesn't have direct login, so we'll use exec
-    const { exec } = await import('child_process');
-    const { promisify } = await import('util');
-    const execAsync = promisify(exec);
-    
-    // Build docker login command
-    const loginCmd = `echo "${tokenData.token}" | docker login --username AWS --password-stdin ${tokenData.registry}`;
-    
-    await execAsync(loginCmd);
-    console.log(`✅ Docker authenticated with ECR`);
-    return true;
-  } catch (error) {
-    console.warn(`⚠️ Failed to authenticate Docker with ECR:`, error.message);
-    return false;
-  }
+  console.log(`🔐 Preparing ECR auth config for registry: ${tokenData.registry}`);
+  
+  // Dockerode expects auth config in format:
+  // { username: 'AWS', password: '<token>', serveraddress: '<registry>' }
+  const authConfig = {
+    username: 'AWS',
+    password: tokenData.token,
+    serveraddress: tokenData.registry
+  };
+  
+  console.log(`✅ ECR auth config prepared`);
+  return authConfig;
 }
 
 /**
@@ -301,12 +295,13 @@ async function startCrawlerContainer(job) {
           throw new Error(`Failed to get ECR token from backend`);
         }
         
-        await authenticateECR(tokenData);
-        console.log(`✅ ECR authentication successful`);
+        // Get auth config for Dockerode
+        const authConfig = getECRAuthConfig(tokenData);
         
         console.log(`📥 Pulling image from ECR: ${image_url}`);
         await new Promise((resolve, reject) => {
-          docker.pull(image_url, (err, stream) => {
+          // Pass auth config to docker.pull() - Dockerode will use it for authentication
+          docker.pull(image_url, { authconfig: authConfig }, (err, stream) => {
             if (err) return reject(err);
             
             docker.modem.followProgress(stream, (err, output) => {
