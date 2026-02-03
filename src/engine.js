@@ -606,6 +606,98 @@ async function cleanupContainers() {
 }
 
 /**
+ * Check for and pull latest helper image from ECR
+ * Returns true if a new image was pulled, false otherwise
+ */
+async function checkAndUpdateHelperImage() {
+  try {
+    console.log(`🔄 Checking for updated helper image: ${HELPER_ECR_IMAGE}`);
+    
+    // Get current image digest
+    let currentDigest = null;
+    try {
+      const images = await docker.listImages();
+      const currentImage = images.find(img => 
+        img.RepoTags && img.RepoTags.some(tag => tag.includes(HELPER_IMAGE_NAME))
+      );
+      if (currentImage) {
+        currentDigest = currentImage.Id;
+        console.log(`📦 Current image digest: ${currentDigest.substring(0, 12)}...`);
+      }
+    } catch (error) {
+      console.warn(`⚠️ Could not get current image info: ${error.message}`);
+    }
+    
+    // Pull latest image from ECR (public repository, no auth needed)
+    console.log(`📥 Pulling latest image from ECR...`);
+    try {
+      await new Promise((resolve, reject) => {
+        docker.pull(HELPER_ECR_IMAGE, (err, stream) => {
+          if (err) return reject(err);
+          
+          docker.modem.followProgress(stream, (err, output) => {
+            if (err) return reject(err);
+            console.log(`✅ Image pull completed`);
+            resolve();
+          });
+        });
+      });
+      
+      // Check if we got a new image
+      const images = await docker.listImages();
+      const newImage = images.find(img => 
+        img.RepoTags && img.RepoTags.some(tag => tag === HELPER_ECR_IMAGE || tag.includes(HELPER_IMAGE_NAME))
+      );
+      
+      if (newImage) {
+        const newDigest = newImage.Id;
+        if (currentDigest && newDigest === currentDigest) {
+          console.log(`ℹ️  Image is up to date (digest: ${newDigest.substring(0, 12)}...)`);
+          return false; // No update needed
+        } else {
+          console.log(`🆕 New image available! (digest: ${newDigest.substring(0, 12)}...)`);
+          console.log(`🔄 New image pulled successfully. Container will restart on next check.`);
+          return true; // New image available
+        }
+      }
+      
+      return false;
+    } catch (pullError) {
+      console.warn(`⚠️ Failed to pull image: ${pullError.message}`);
+      return false;
+    }
+  } catch (error) {
+    console.error(`❌ Error checking for image updates: ${error.message}`);
+    return false;
+  }
+}
+
+/**
+ * Restart helper container with new image
+ * This is called when a new image is detected
+ */
+async function restartHelperContainer() {
+  try {
+    console.log(`🔄 Restarting helper container with new image...`);
+    
+    // Get container name from environment or use default
+    const containerName = process.env.HOSTNAME || 'aionqa-helper';
+    
+    // Note: We can't restart ourselves directly, but we can signal the orchestrator
+    // For docker-compose, the restart policy will handle it
+    // For manual docker run, the user needs to restart manually
+    console.log(`ℹ️  New image available. Please restart the container to use it:`);
+    console.log(`   docker restart ${containerName}`);
+    console.log(`   Or: docker compose -f docker-compose.helper.yml restart`);
+    
+    // Exit gracefully - the orchestrator (docker-compose restart: always) will restart us
+    process.exit(0);
+  } catch (error) {
+    console.error(`❌ Error restarting container: ${error.message}`);
+  }
+}
+
+/**
  * Main loop
  */
 async function main() {
@@ -642,6 +734,25 @@ async function main() {
 
   // Cleanup containers every 5 minutes
   setInterval(cleanupContainers, 5 * 60 * 1000);
+  
+  // Check for helper image updates on startup
+  console.log(`🔄 Checking for helper image updates on startup...`);
+  const startupUpdate = await checkAndUpdateHelperImage();
+  if (startupUpdate) {
+    console.log(`🆕 New helper image detected on startup. Restarting...`);
+    await restartHelperContainer();
+    return; // Exit to allow restart
+  }
+  
+  // Check for helper image updates every 12 hours
+  setInterval(async () => {
+    console.log(`🔄 Periodic check for helper image updates (every 12 hours)...`);
+    const hasUpdate = await checkAndUpdateHelperImage();
+    if (hasUpdate) {
+      console.log(`🆕 New helper image detected. Restarting...`);
+      await restartHelperContainer();
+    }
+  }, IMAGE_UPDATE_INTERVAL);
 
   // Main polling loop
   let pollCount = 0;
