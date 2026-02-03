@@ -64,39 +64,93 @@ function getServiceKeyHeaders() {
 }
 
 /**
- * Get crawler image URL from backend using service key
- * Falls back to image_url from job if service key not available
+ * Get full ECR image URL from backend
+ * Converts local image names (like "aionqa-unified-crawler:latest") to full ECR URLs
+ * Uses ENGINE_TOKEN for authentication (no SERVICE_KEY needed)
  */
-async function getCrawlerImageUrl() {
-  // If no service key, return null (will use image_url from job)
-  if (!SERVICE_KEY) {
-    return null;
-  }
-  
+async function getImageUrlFromBackend(imageName) {
   try {
-    const headers = getServiceKeyHeaders();
-    if (!headers) {
-      return null;
+    // If already full ECR URL, return as-is
+    if (imageName.includes('.dkr.ecr.') || imageName.includes('amazonaws.com')) {
+      return { image_url: imageName, requires_auth: true };
     }
     
-    console.log(`📥 Requesting crawler image URL from backend...`);
-    const response = await axios.get(
-      `${BACKEND_URL}/api/service/crawler-image`,
+    console.log(`📥 Requesting full ECR image URL from backend for: ${imageName}`);
+    const response = await axios.post(
+      `${BACKEND_URL}/api/docker-engines/image-url`,
+      { image_name: imageName },
       {
-        headers,
+        headers: getAuthHeaders(),
         timeout: 10000
       }
     );
     
     if (response.data && response.data.image_url) {
-      console.log(`✅ Got crawler image URL from backend: ${response.data.image_url}`);
-      return response.data.image_url;
+      console.log(`✅ Got full ECR image URL from backend: ${response.data.image_url} (auth: ${response.data.requires_auth ? 'required' : 'public'})`);
+      return response.data;
     }
     
     return null;
   } catch (error) {
-    console.warn(`⚠️ Failed to get image URL from backend, will use job image_url:`, error.message);
+    console.warn(`⚠️ Failed to get image URL from backend:`, error.message);
     return null;
+  }
+}
+
+/**
+ * Get ECR pull token from backend
+ * Returns token for authenticating Docker with ECR
+ */
+async function getECRPullToken() {
+  try {
+    console.log(`🔑 Requesting temporary ECR pull token from backend...`);
+    const response = await axios.post(
+      `${BACKEND_URL}/api/docker-engines/ecr-token`,
+      {},
+      {
+        headers: getAuthHeaders(),
+        timeout: 10000
+      }
+    );
+    
+    if (response.data && response.data.token) {
+      console.log(`✅ Got temporary ECR pull token (expires in ${response.data.expires_in}s)`);
+      return response.data;
+    }
+    
+    return null;
+  } catch (error) {
+    console.warn(`⚠️ Failed to get ECR token from backend:`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Authenticate Docker with ECR using temporary token
+ */
+async function authenticateECR(tokenData) {
+  if (!tokenData || !tokenData.token || !tokenData.registry) {
+    return false;
+  }
+  
+  try {
+    console.log(`🔐 Authenticating Docker with ECR registry: ${tokenData.registry}`);
+    
+    // Use dockerode to authenticate
+    // Note: dockerode doesn't have direct login, so we'll use exec
+    const { exec } = await import('child_process');
+    const { promisify } = await import('util');
+    const execAsync = promisify(exec);
+    
+    // Build docker login command
+    const loginCmd = `echo "${tokenData.token}" | docker login --username AWS --password-stdin ${tokenData.registry}`;
+    
+    await execAsync(loginCmd);
+    console.log(`✅ Docker authenticated with ECR`);
+    return true;
+  } catch (error) {
+    console.warn(`⚠️ Failed to authenticate Docker with ECR:`, error.message);
+    return false;
   }
 }
 
