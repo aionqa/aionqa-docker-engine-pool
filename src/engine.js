@@ -303,8 +303,8 @@ async function startCrawlerContainer(job) {
       if (image_url.startsWith('aionqa-unified-crawler')) {
         repository = `aionqa-unified-crawler${image_url.replace('aionqa-unified-crawler', '')}`;
         requiresAuth = true; // PRIVATE - requires auth
-      } else if (image_url.startsWith('aionqa-runner') || image_url.startsWith('aionqa-docker-engine-pool')) {
-        repository = `aionqa-docker-engine-pool${image_url.replace(/aionqa-(runner|docker-engine-pool)/, '')}`;
+      } else if (image_url.startsWith('aionqa-docker-engine-pool')) {
+        repository = `aionqa-docker-engine-pool${image_url.replace('aionqa-docker-engine-pool', '')}`;
         requiresAuth = false; // PUBLIC - no auth
       } else {
         // Default: assume it's a crawler image
@@ -317,7 +317,7 @@ async function startCrawlerContainer(job) {
     }
   } else {
     // Already full ECR URL
-    requiresAuth = !image_url.includes('aionqa-runner') && !image_url.includes('aionqa-docker-engine-pool'); // Helper images are public
+    requiresAuth = !image_url.includes('aionqa-docker-engine-pool'); // Helper images are public
   }
 
   console.log(`🚀 Starting container for job ${job_id}`);
@@ -399,8 +399,8 @@ async function startCrawlerContainer(job) {
             if (image_url.startsWith('aionqa-unified-crawler')) {
               repository = `aionqa-unified-crawler${image_url.replace('aionqa-unified-crawler', '')}`;
               requiresAuth = true;
-            } else if (image_url.startsWith('aionqa-runner') || image_url.startsWith('aionqa-docker-engine-pool')) {
-              repository = `aionqa-docker-engine-pool${image_url.replace(/aionqa-(runner|docker-engine-pool)/, '')}`;
+            } else if (image_url.startsWith('aionqa-docker-engine-pool')) {
+              repository = `aionqa-docker-engine-pool${image_url.replace('aionqa-docker-engine-pool', '')}`;
               requiresAuth = false;
             } else {
               repository = image_url;
