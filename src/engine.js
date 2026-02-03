@@ -18,10 +18,6 @@ const ENGINE_ID = process.env.ENGINE_ID || `docker-engine-${hostname()}-${random
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '5000'); // 5 seconds
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 const IMAGE_UPDATE_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours in milliseconds
-const HELPER_IMAGE_NAME = process.env.HELPER_IMAGE_NAME || 'aionqa-docker-engine-pool';
-const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || '778954507986';
-const AWS_REGION = process.env.AWS_REGION || 'ap-southeast-2';
-const HELPER_ECR_IMAGE = `${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${HELPER_IMAGE_NAME}:latest`;
 
 // ECR repositories are public - no AWS credentials needed
 // Helper uses ENGINE_TOKEN (project credentials) for backend authentication only
@@ -68,50 +64,19 @@ function getServiceKeyHeaders() {
   };
 }
 
-/**
- * Get full ECR image URL from backend
- * Converts local image names (like "aionqa-unified-crawler:latest") to full ECR URLs
- * Uses ENGINE_TOKEN for authentication (no SERVICE_KEY needed)
- */
-async function getImageUrlFromBackend(imageName) {
-  try {
-    // If already full ECR URL, return as-is
-    if (imageName.includes('.dkr.ecr.') || imageName.includes('amazonaws.com')) {
-      return { image_url: imageName, requires_auth: true };
-    }
-    
-    console.log(`📥 Requesting full ECR image URL from backend for: ${imageName}`);
-    const response = await axios.post(
-      `${BACKEND_URL}/api/docker-engines/image-url`,
-      { image_name: imageName },
-      {
-        headers: getAuthHeaders(),
-        timeout: 10000
-      }
-    );
-    
-    if (response.data && response.data.image_url) {
-      console.log(`✅ Got full ECR image URL from backend: ${response.data.image_url} (auth: ${response.data.requires_auth ? 'required' : 'public'})`);
-      return response.data;
-    }
-    
-    return null;
-  } catch (error) {
-    console.warn(`⚠️ Failed to get image URL from backend:`, error.message);
-    return null;
-  }
-}
+// getImageUrlFromBackend removed - backend now provides full image_url in job response
 
 /**
  * Get ECR pull token from backend
  * Returns token for authenticating Docker with ECR
+ * @param {string} imageUrl - Full ECR image URL (optional, but recommended)
  */
-async function getECRPullToken() {
+async function getECRPullToken(imageUrl = null) {
   try {
     console.log(`🔑 Requesting temporary ECR pull token from backend...`);
     const response = await axios.post(
       `${BACKEND_URL}/api/docker-engines/ecr-token`,
-      {},
+      imageUrl ? { image_url: imageUrl } : {},
       {
         headers: getAuthHeaders(),
         timeout: 10000
@@ -274,83 +239,72 @@ async function pollForJobs() {
 async function startCrawlerContainer(job) {
   const {
     job_id,
-    job_type, // Get job_type from backend response
-    image_url: jobImageUrl, // Image URL from job (may be overridden)
+    job_type,
+    image_url: jobImageUrl, // Full ECR URL from backend
+    image_sha: jobImageSha, // SHA digest from backend (for comparison)
     environment_vars,
     runner_token,
     backend_url
   } = job;
   
-  // ECR repositories are public - no authentication required
-  // Helper uses ENGINE_TOKEN (project credentials) for backend authentication only
-  // No AWS credentials needed for image pulls
+  // Backend provides everything: image_url (full ECR URL) and image_sha
+  // Helper only needs to compare SHA and pull if needed
+  const image_url = jobImageUrl;
   
-  // Get full ECR image URL from backend if needed
-  let image_url = jobImageUrl;
-  let requiresAuth = true;
-  
-  // If image_url is a local name (not full ECR URL), resolve it via backend
-  if (!image_url.includes('.dkr.ecr.') && !image_url.includes('amazonaws.com')) {
-    console.log(`📥 Resolving image URL from backend: ${image_url}`);
-    const imageUrlData = await getImageUrlFromBackend(image_url);
-    if (imageUrlData && imageUrlData.image_url) {
-      image_url = imageUrlData.image_url;
-      requiresAuth = imageUrlData.requires_auth !== false;
-      console.log(`✅ Resolved to: ${image_url} (auth: ${requiresAuth ? 'required' : 'public'})`);
-    } else {
-      // Backend failed - construct ECR URL manually as fallback
-      console.warn(`⚠️ Failed to resolve image URL from backend, constructing ECR URL manually`);
-      const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || '778954507986';
-      const AWS_REGION = process.env.AWS_REGION || 'ap-southeast-2';
-      
-      // Map common image names to ECR repositories
-      let repository = image_url;
-      if (image_url.startsWith('aionqa-unified-crawler')) {
-        repository = `aionqa-unified-crawler${image_url.replace('aionqa-unified-crawler', '')}`;
-        requiresAuth = true; // PRIVATE - requires auth
-      } else if (image_url.startsWith('aionqa-docker-engine-pool')) {
-        repository = `aionqa-docker-engine-pool${image_url.replace('aionqa-docker-engine-pool', '')}`;
-        requiresAuth = false; // PUBLIC - no auth
-      } else {
-        // Default: assume it's a crawler image
-        repository = image_url;
-        requiresAuth = true;
-      }
-      
-      image_url = `${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repository}`;
-      console.log(`📦 Constructed ECR URL: ${image_url} (auth: ${requiresAuth ? 'required' : 'public'})`);
-    }
-  } else {
-    // Already full ECR URL
-    requiresAuth = !image_url.includes('aionqa-docker-engine-pool'); // Helper images are public
+  if (!image_url) {
+    throw new Error(`Job ${job_id} missing image_url`);
   }
 
   console.log(`🚀 Starting container for job ${job_id}`);
   console.log(`   Image: ${image_url}`);
+  if (jobImageSha) {
+    console.log(`   Expected SHA: ${jobImageSha.substring(0, 12)}...`);
+  }
 
   try {
-    // ALWAYS pull the latest image from ECR before starting container
-    // This ensures we're always using the most up-to-date code
     const isECRImage = image_url.includes('.dkr.ecr.') || image_url.includes('amazonaws.com');
-    const isLocalImage = image_url.includes('localhost') || (!image_url.includes('.') && !image_url.includes('/'));
     
     if (isECRImage) {
-      // ECR requires authentication for ALL repositories (even public ones)
-      // Always authenticate before pulling from ECR
-      console.log(`🔑 Authenticating with ECR before pulling image...`);
-      const tokenData = await getECRPullToken();
-      if (tokenData) {
-        await authenticateECR(tokenData);
-        console.log(`✅ ECR authentication successful`);
+      // Check if we need to pull the image by comparing SHA
+      let needsPull = true;
+      
+      if (jobImageSha) {
+        // Check if local image exists and matches SHA
+        try {
+          const images = await docker.listImages();
+          const localImage = images.find(img => {
+            if (!img.RepoTags) return false;
+            const matchesTag = img.RepoTags.some(tag => tag === image_url || tag.startsWith(image_url.split(':')[0] + ':'));
+            if (!matchesTag) return false;
+            // Check if SHA matches (Docker image ID is the SHA)
+            return img.Id === jobImageSha || img.Id.startsWith(jobImageSha.replace('sha256:', ''));
+          });
+          
+          if (localImage) {
+            console.log(`✅ Local image found with matching SHA - no pull needed`);
+            needsPull = false;
+          } else {
+            console.log(`📥 Local image missing or SHA mismatch - will pull from ECR`);
+          }
+        } catch (checkError) {
+          console.warn(`⚠️ Could not check local image: ${checkError.message}, will pull`);
+        }
       } else {
-        console.error(`❌ Failed to get ECR token from backend - cannot pull image without authentication`);
-        throw new Error(`ECR authentication failed: backend returned error when requesting token`);
+        console.log(`📥 No SHA provided - will pull to ensure latest version`);
       }
       
-      console.log(`📥 Pulling latest image from ECR: ${image_url}`);
-      
-      // Pull the latest image (Docker will use cache if up-to-date)
-      try {
+      if (needsPull) {
+        // Request ECR token from backend with image URL
+        console.log(`🔑 Requesting ECR token from backend for image: ${image_url}`);
+        const tokenData = await getECRPullToken(image_url);
+        if (!tokenData) {
+          throw new Error(`Failed to get ECR token from backend`);
+        }
+        
+        await authenticateECR(tokenData);
+        console.log(`✅ ECR authentication successful`);
+        
+        console.log(`📥 Pulling image from ECR: ${image_url}`);
         await new Promise((resolve, reject) => {
           docker.pull(image_url, (err, stream) => {
             if (err) return reject(err);
@@ -362,22 +316,6 @@ async function startCrawlerContainer(job) {
             });
           });
         });
-      } catch (pullError) {
-        console.error(`❌ Failed to pull image: ${pullError.message}`);
-        // Check if image exists locally as fallback
-        try {
-          const images = await docker.listImages();
-          const localImage = images.find(img => 
-            img.RepoTags && img.RepoTags.some(tag => tag === image_url || tag.startsWith(image_url.split(':')[0] + ':'))
-          );
-          if (localImage) {
-            console.warn(`⚠️ Using cached image (pull failed but image exists locally)`);
-          } else {
-            throw pullError; // Re-throw if no local image
-          }
-        } catch {
-          throw pullError; // Re-throw if can't check or no local image
-        }
       }
     } else {
       // Not an ECR image - check if it exists locally, if not try to pull from ECR
@@ -390,60 +328,9 @@ async function startCrawlerContainer(job) {
         if (localImage) {
           console.log(`✅ Local image found: ${image_url}`);
         } else {
-          // Image doesn't exist locally - try to construct ECR URL and pull
-          console.warn(`⚠️ Local image not found: ${image_url}`);
-          console.log(`📥 Attempting to pull from ECR...`);
-          
-          const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || '778954507986';
-          const AWS_REGION = process.env.AWS_REGION || 'ap-southeast-2';
-          let ecrUrl = image_url;
-          
-          // Construct ECR URL if it's a local name
-          if (!image_url.includes('.dkr.ecr.')) {
-            let repository = image_url;
-            if (image_url.startsWith('aionqa-unified-crawler')) {
-              repository = `aionqa-unified-crawler${image_url.replace('aionqa-unified-crawler', '')}`;
-              requiresAuth = true;
-            } else if (image_url.startsWith('aionqa-docker-engine-pool')) {
-              repository = `aionqa-docker-engine-pool${image_url.replace('aionqa-docker-engine-pool', '')}`;
-              requiresAuth = false;
-            } else {
-              repository = image_url;
-              requiresAuth = true;
-            }
-            ecrUrl = `${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repository}`;
-            console.log(`📦 Constructed ECR URL: ${ecrUrl}`);
-          }
-          
-          // ECR requires authentication for ALL repositories (even public ones)
-          // Always authenticate before pulling from ECR
-          console.log(`🔑 Authenticating with ECR before pulling fallback image...`);
-          const tokenData = await getECRPullToken();
-          if (tokenData) {
-            await authenticateECR(tokenData);
-            console.log(`✅ ECR authentication successful`);
-          } else {
-            console.error(`❌ Failed to get ECR token from backend - cannot pull image without authentication`);
-            throw new Error(`ECR authentication failed: backend returned error when requesting token`);
-          }
-          
-          // Try to pull from ECR
-          try {
-            await new Promise((resolve, reject) => {
-              docker.pull(ecrUrl, (err, stream) => {
-                if (err) return reject(err);
-                docker.modem.followProgress(stream, (err, output) => {
-                  if (err) return reject(err);
-                  console.log(`✅ Image pulled successfully from ECR: ${ecrUrl}`);
-                  image_url = ecrUrl; // Update to use ECR URL
-                  resolve();
-                });
-              });
-            });
-          } catch (pullError) {
-            console.error(`❌ Failed to pull image from ECR: ${pullError.message}`);
-            throw new Error(`Image ${image_url} not found locally and failed to pull from ECR: ${pullError.message}`);
-          }
+          // Image doesn't exist locally - this shouldn't happen if backend provides ECR URL
+          // But if it does, we can't pull without backend providing the URL
+          throw new Error(`Image ${image_url} not found locally and backend did not provide ECR URL`);
         }
       } catch (checkError) {
         console.error(`❌ Error checking local images: ${checkError.message}`);
