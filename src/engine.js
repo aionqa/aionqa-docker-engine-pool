@@ -376,7 +376,7 @@ async function startCrawlerContainer(job) {
       Env: containerEnv,
       HostConfig: {
         ShmSize: 2147483648, // 2GB for Chromium
-        NetworkMode: 'aionqa_default', // Use docker-compose network for local development
+        NetworkMode: 'aionqa-network', // Use the same network as helper (from docker-compose.helper.yml)
         AutoRemove: false, // Keep containers for debugging (can be set to true in production)
         RestartPolicy: { Name: 'no' }, // Don't restart
         Binds: ['/var/run/docker.sock:/var/run/docker.sock'] // Mount docker socket for video recording
