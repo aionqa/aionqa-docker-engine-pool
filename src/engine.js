@@ -370,6 +370,24 @@ async function startCrawlerContainer(job) {
     // Generate container name: aionqa-crawler-job-{jobId}
     const containerName = `aionqa-crawler-job-${job_id}`;
     
+    // Clean up any existing container with the same name (from previous failed attempts)
+    try {
+      const existingContainer = docker.getContainer(containerName);
+      const containerInfo = await existingContainer.inspect();
+      if (containerInfo) {
+        console.log(`🧹 Cleaning up existing container: ${containerName}`);
+        try {
+          await existingContainer.stop();
+        } catch (stopError) {
+          // Container might already be stopped, ignore
+        }
+        await existingContainer.remove();
+        console.log(`✅ Removed existing container: ${containerName}`);
+      }
+    } catch (notFoundError) {
+      // Container doesn't exist, that's fine - continue
+    }
+    
     const container = await docker.createContainer({
       Image: image_url,
       name: containerName, // Use consistent naming pattern
