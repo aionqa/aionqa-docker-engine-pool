@@ -293,11 +293,31 @@ async function startCrawlerContainer(job) {
       requiresAuth = imageUrlData.requires_auth !== false;
       console.log(`✅ Resolved to: ${image_url} (auth: ${requiresAuth ? 'required' : 'public'})`);
     } else {
-      console.warn(`⚠️ Failed to resolve image URL, will try to use: ${image_url}`);
+      // Backend failed - construct ECR URL manually as fallback
+      console.warn(`⚠️ Failed to resolve image URL from backend, constructing ECR URL manually`);
+      const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || '778954507986';
+      const AWS_REGION = process.env.AWS_REGION || 'ap-southeast-2';
+      
+      // Map common image names to ECR repositories
+      let repository = image_url;
+      if (image_url.startsWith('aionqa-unified-crawler')) {
+        repository = `aionqa-unified-crawler${image_url.replace('aionqa-unified-crawler', '')}`;
+        requiresAuth = true; // PRIVATE - requires auth
+      } else if (image_url.startsWith('aionqa-runner') || image_url.startsWith('aionqa-docker-engine-pool')) {
+        repository = `aionqa-docker-engine-pool${image_url.replace(/aionqa-(runner|docker-engine-pool)/, '')}`;
+        requiresAuth = false; // PUBLIC - no auth
+      } else {
+        // Default: assume it's a crawler image
+        repository = image_url;
+        requiresAuth = true;
+      }
+      
+      image_url = `${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repository}`;
+      console.log(`📦 Constructed ECR URL: ${image_url} (auth: ${requiresAuth ? 'required' : 'public'})`);
     }
   } else {
     // Already full ECR URL
-    requiresAuth = !image_url.includes('aionqa-runner'); // Helper images are public
+    requiresAuth = !image_url.includes('aionqa-runner') && !image_url.includes('aionqa-docker-engine-pool'); // Helper images are public
   }
 
   console.log(`🚀 Starting container for job ${job_id}`);
@@ -354,10 +374,72 @@ async function startCrawlerContainer(job) {
           throw pullError; // Re-throw if can't check or no local image
         }
       }
-    } else if (isLocalImage) {
-      console.log(`ℹ️  Using local image (not from ECR): ${image_url}`);
     } else {
-      console.log(`ℹ️  Using image: ${image_url} (assuming local or already pulled)`);
+      // Not an ECR image - check if it exists locally, if not try to pull from ECR
+      console.log(`ℹ️  Checking if local image exists: ${image_url}`);
+      try {
+        const images = await docker.listImages();
+        const localImage = images.find(img => 
+          img.RepoTags && img.RepoTags.some(tag => tag === image_url || tag.startsWith(image_url.split(':')[0] + ':'))
+        );
+        if (localImage) {
+          console.log(`✅ Local image found: ${image_url}`);
+        } else {
+          // Image doesn't exist locally - try to construct ECR URL and pull
+          console.warn(`⚠️ Local image not found: ${image_url}`);
+          console.log(`📥 Attempting to pull from ECR...`);
+          
+          const AWS_ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || '778954507986';
+          const AWS_REGION = process.env.AWS_REGION || 'ap-southeast-2';
+          let ecrUrl = image_url;
+          
+          // Construct ECR URL if it's a local name
+          if (!image_url.includes('.dkr.ecr.')) {
+            let repository = image_url;
+            if (image_url.startsWith('aionqa-unified-crawler')) {
+              repository = `aionqa-unified-crawler${image_url.replace('aionqa-unified-crawler', '')}`;
+              requiresAuth = true;
+            } else if (image_url.startsWith('aionqa-runner') || image_url.startsWith('aionqa-docker-engine-pool')) {
+              repository = `aionqa-docker-engine-pool${image_url.replace(/aionqa-(runner|docker-engine-pool)/, '')}`;
+              requiresAuth = false;
+            } else {
+              repository = image_url;
+              requiresAuth = true;
+            }
+            ecrUrl = `${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repository}`;
+            console.log(`📦 Constructed ECR URL: ${ecrUrl}`);
+          }
+          
+          // Get ECR token if needed
+          if (requiresAuth) {
+            const tokenData = await getECRPullToken();
+            if (tokenData) {
+              await authenticateECR(tokenData);
+            }
+          }
+          
+          // Try to pull from ECR
+          try {
+            await new Promise((resolve, reject) => {
+              docker.pull(ecrUrl, (err, stream) => {
+                if (err) return reject(err);
+                docker.modem.followProgress(stream, (err, output) => {
+                  if (err) return reject(err);
+                  console.log(`✅ Image pulled successfully from ECR: ${ecrUrl}`);
+                  image_url = ecrUrl; // Update to use ECR URL
+                  resolve();
+                });
+              });
+            });
+          } catch (pullError) {
+            console.error(`❌ Failed to pull image from ECR: ${pullError.message}`);
+            throw new Error(`Image ${image_url} not found locally and failed to pull from ECR: ${pullError.message}`);
+          }
+        }
+      } catch (checkError) {
+        console.error(`❌ Error checking local images: ${checkError.message}`);
+        throw new Error(`Cannot verify or pull image ${image_url}: ${checkError.message}`);
+      }
     }
 
     // Create container
