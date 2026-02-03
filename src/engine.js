@@ -38,6 +38,7 @@ console.log(`⏱️  Poll interval: ${POLL_INTERVAL}ms`);
 console.log(`🔌 Docker socket: ${DOCKER_SOCKET}`);
 
 // Initialize Docker client
+// Note: We'll set authconfig per-pull, not globally
 const docker = new Docker({ socketPath: DOCKER_SOCKET });
 
 // Track running containers (containerId -> jobId)
@@ -106,15 +107,18 @@ function getECRAuthConfig(tokenData) {
   
   console.log(`🔐 Preparing ECR auth config for registry: ${tokenData.registry}`);
   
-  // Dockerode expects auth config in format:
+  // Dockerode expects auth config in format for authconfig:
   // { username: 'AWS', password: '<token>', serveraddress: '<registry>' }
+  // But we also need to encode it properly for the Docker API
   const authConfig = {
     username: 'AWS',
     password: tokenData.token,
-    serveraddress: tokenData.registry
+    serveraddress: tokenData.registry,
+    // Also include auth field for Docker API compatibility
+    auth: Buffer.from(`AWS:${tokenData.token}`).toString('base64')
   };
   
-  console.log(`✅ ECR auth config prepared`);
+  console.log(`✅ ECR auth config prepared (username: ${authConfig.username}, registry: ${authConfig.serveraddress})`);
   return authConfig;
 }
 
@@ -300,12 +304,22 @@ async function startCrawlerContainer(job) {
         
         console.log(`📥 Pulling image from ECR: ${image_url}`);
         await new Promise((resolve, reject) => {
-          // Pass auth config to docker.pull() - Dockerode will use it for authentication
-          docker.pull(image_url, { authconfig: authConfig }, (err, stream) => {
-            if (err) return reject(err);
+          // Dockerode pull with auth - authconfig must be in modem options
+          const pullOptions = {
+            authconfig: authConfig
+          };
+          
+          docker.pull(image_url, pullOptions, (err, stream) => {
+            if (err) {
+              console.error(`❌ Pull error:`, err.message);
+              return reject(err);
+            }
             
             docker.modem.followProgress(stream, (err, output) => {
-              if (err) return reject(err);
+              if (err) {
+                console.error(`❌ Progress error:`, err.message);
+                return reject(err);
+              }
               console.log(`✅ Image pulled successfully`);
               resolve();
             });
