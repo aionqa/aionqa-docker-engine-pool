@@ -628,9 +628,18 @@ async function checkAndUpdateHelperImage() {
       console.warn(`⚠️ Could not get current image info: ${error.message}`);
     }
     
-    // Pull latest image from ECR (public repository, no auth needed)
+    // Pull latest image from ECR (requires authentication even for public repos)
     console.log(`📥 Pulling latest image from ECR...`);
     try {
+      // Get ECR authentication token first
+      const tokenData = await getECRPullToken();
+      if (tokenData) {
+        await authenticateECR(tokenData);
+        console.log(`✅ Authenticated with ECR, proceeding to pull image...`);
+      } else {
+        console.warn(`⚠️ Could not get ECR token, will try to pull anyway (may fail)`);
+      }
+      
       await new Promise((resolve, reject) => {
         docker.pull(HELPER_ECR_IMAGE, (err, stream) => {
           if (err) return reject(err);
