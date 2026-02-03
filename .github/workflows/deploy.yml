@@ -41,4 +41,11 @@ jobs:
           docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "✅ Helper image pushed to ECR: $ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          echo "вњ… Helper image pushed to ECR: $ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+      - name: Make ECR repository public
+        run: |
+          aws ecr set-repository-policy \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --policy-text '{"Version":"2012-10-17","Statement":[{"Sid":"PublicRead","Effect":"Allow","Principal":"*","Action":["ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","ecr:BatchCheckLayerAvailability"]}]}' \
+            --region ${{ env.AWS_REGION }}
