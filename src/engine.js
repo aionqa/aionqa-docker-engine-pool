@@ -335,16 +335,16 @@ async function startCrawlerContainer(job) {
     const isLocalImage = image_url.includes('localhost') || (!image_url.includes('.') && !image_url.includes('/'));
     
     if (isECRImage) {
-      // Get ECR token if authentication is required
-      if (requiresAuth) {
-        const tokenData = await getECRPullToken();
-        if (tokenData) {
-          await authenticateECR(tokenData);
-        } else {
-          console.warn(`⚠️ Could not get ECR token, will try to pull anyway (may fail for private repos)`);
-        }
+      // ECR requires authentication for ALL repositories (even public ones)
+      // Always authenticate before pulling from ECR
+      console.log(`🔑 Authenticating with ECR before pulling image...`);
+      const tokenData = await getECRPullToken();
+      if (tokenData) {
+        await authenticateECR(tokenData);
+        console.log(`✅ ECR authentication successful`);
       } else {
-        console.log(`ℹ️  Image is public, no authentication needed`);
+        console.error(`❌ Failed to get ECR token from backend - cannot pull image without authentication`);
+        throw new Error(`ECR authentication failed: backend returned error when requesting token`);
       }
       
       console.log(`📥 Pulling latest image from ECR: ${image_url}`);
