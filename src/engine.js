@@ -543,8 +543,15 @@ const processingJobs = new Set();
 /**
  * Pull AI service image from ECR using short-lived token
  * Same mechanism as crawler images
+ * Only pulls if AI_SERVICE env var is set to 'true'
  */
 async function pullAIServiceImage() {
+  // Only pull if AI_SERVICE is enabled
+  const aiServiceEnabled = process.env.AI_SERVICE === 'true' || process.env.AI_SERVICE === '1';
+  if (!aiServiceEnabled) {
+    console.log(`ℹ️  AI_SERVICE not enabled, skipping AI service image pull`);
+    return;
+  }
   // Priority: 1. AI_SERVICE_IMAGE_URL env var, 2. Extract from AI_SERVICE_URL if ECR, 3. Get from backend
   let imageUrl = process.env.AI_SERVICE_IMAGE_URL;
   
