@@ -650,6 +650,9 @@ async function main() {
     console.warn(`⚠️  Engine registration failed - continuing with polling (engine may be pre-registered)`);
   }
 
+  // Pull AI service image from ECR if needed (using short-lived token)
+  await pullAIServiceImage();
+
   // Send heartbeat every 30 seconds
   setInterval(sendHeartbeat, 30000);
 
