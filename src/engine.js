@@ -541,6 +541,62 @@ async function cleanupContainers() {
 const processingJobs = new Set();
 
 /**
+ * Update helper image from ECR if newer version available
+ * Uses short-lived token from backend
+ */
+async function updateHelperImage() {
+  try {
+    console.log(`🔄 Checking for helper image updates...`);
+    
+    // Get helper image URL from backend
+    const response = await axios.post(
+      `${BACKEND_URL}/api/docker-engines/image-url`,
+      { image_name: 'aionqa-docker-engine-pool:latest' },
+      { headers: getAuthHeaders(), timeout: 10000 }
+    );
+    
+    if (!response.data || !response.data.image_url) {
+      console.warn(`⚠️ Failed to get helper image URL from backend`);
+      return;
+    }
+    
+    const imageUrl = response.data.image_url;
+    console.log(`📦 Helper image URL: ${imageUrl}`);
+    
+    // Get ECR token and pull latest image
+    console.log(`📥 Pulling latest helper image from ECR: ${imageUrl}`);
+    const tokenData = await getECRPullToken(imageUrl);
+    if (!tokenData) {
+      console.warn(`⚠️ Failed to get ECR token for helper image`);
+      return;
+    }
+    
+    const authConfig = getECRAuthConfig(tokenData);
+    
+    await new Promise((resolve, reject) => {
+      docker.pull(imageUrl, { authconfig: authConfig }, (err, stream) => {
+        if (err) {
+          console.warn(`⚠️ Failed to pull helper image: ${err.message}`);
+          return resolve(); // Don't fail on update
+        }
+        
+        docker.modem.followProgress(stream, (err, output) => {
+          if (err) {
+            console.warn(`⚠️ Helper image pull progress error: ${err.message}`);
+            return resolve(); // Don't fail on update
+          }
+          console.log(`✅ Helper image updated successfully`);
+          resolve();
+        });
+      });
+    });
+  } catch (error) {
+    console.warn(`⚠️ Failed to update helper image: ${error.message}`);
+    // Don't fail startup if helper update fails
+  }
+}
+
+/**
  * Pull AI service image from ECR using short-lived token
  * Same mechanism as crawler images
  * Only pulls if AI_SERVICE env var is set to 'true'
