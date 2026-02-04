@@ -759,33 +759,41 @@ async function main() {
       const job = await pollForJobs();
       
       if (job) {
-        // Check if this job is already being processed
+        // Atomic check-and-set: if job is already being processed, skip it
         if (processingJobs.has(job.job_id)) {
           console.log(`⏭️  [MAIN LOOP] Job ${job.job_id} is already being processed, skipping...`);
           await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
           continue;
         }
         
-        // Mark job as being processed
+        // Mark job as being processed IMMEDIATELY (before any async operations)
+        // This prevents race conditions where the same job is polled twice
         processingJobs.add(job.job_id);
+        console.log(`🔒 [MAIN LOOP] Locked job ${job.job_id} for processing`);
         
         console.log(`📋 [MAIN LOOP] Received job: ${job.job_id}`);
         console.log(`   Job type: ${job.job_type || 'unknown'}`);
         console.log(`   Image: ${job.image_url || 'unknown'}`);
         console.log(`   Full job object keys:`, Object.keys(job).join(', '));
-        try {
-          console.log(`🚀 [MAIN LOOP] Calling startCrawlerContainer for job ${job.job_id}...`);
-          await startCrawlerContainer(job);
-          console.log(`✅ [MAIN LOOP] Successfully started container for job ${job.job_id}`);
-        } catch (containerError) {
-          console.error(`❌ [MAIN LOOP] Failed to start container for job ${job.job_id}:`, containerError.message);
-          console.error(`   Stack:`, containerError.stack);
-          // Remove from processing set on error so it can be retried
-          processingJobs.delete(job.job_id);
-          // Continue polling - don't crash the helper
-        }
-        // Note: We don't remove from processingJobs on success because the job is now running
-        // The cleanup will happen when the container stops (handled elsewhere)
+        
+        // Start container - handle errors but don't block polling
+        startCrawlerContainer(job)
+          .then(() => {
+            console.log(`✅ [MAIN LOOP] Successfully started container for job ${job.job_id}`);
+            // Job is removed from processingJobs in startCrawlerContainer when container starts
+          })
+          .catch((containerError) => {
+            console.error(`❌ [MAIN LOOP] Failed to start container for job ${job.job_id}:`, containerError.message);
+            console.error(`   Stack:`, containerError.stack);
+            // Remove from processing set on error so it can be retried
+            processingJobs.delete(job.job_id);
+            console.log(`🔓 [MAIN LOOP] Unlocked job ${job.job_id} due to error`);
+          });
+        
+        // Continue polling immediately (don't wait for container to start)
+        // This prevents blocking and allows processing multiple jobs
+        // Small delay to prevent tight loop if backend keeps returning same job
+        await new Promise(resolve => setTimeout(resolve, 1000));
       } else {
         // Log occasionally when no jobs (every 12 polls = 1 minute)
         if (pollCount % 12 === 0) {
