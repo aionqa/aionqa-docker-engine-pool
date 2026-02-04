@@ -541,6 +541,84 @@ async function cleanupContainers() {
 const processingJobs = new Set();
 
 /**
+ * Pull AI service image from ECR using short-lived token
+ * Same mechanism as crawler images
+ */
+async function pullAIServiceImage() {
+  const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://aionqa-ai-service:5000';
+  
+  // Only pull if URL is an ECR URL
+  if (!aiServiceUrl.includes('.dkr.ecr.') && !aiServiceUrl.includes('amazonaws.com')) {
+    console.log(`ℹ️  AI Service URL is not ECR (${aiServiceUrl}), skipping image pull`);
+    return;
+  }
+  
+  // Extract image URL from AI_SERVICE_URL
+  // Format: http://778954507986.dkr.ecr.ap-southeast-2.amazonaws.com/aionqa-ai-service:latest
+  // Or: 778954507986.dkr.ecr.ap-southeast-2.amazonaws.com/aionqa-ai-service:latest
+  let imageUrl = aiServiceUrl.replace(/^https?:\/\//, ''); // Remove http:// or https://
+  if (!imageUrl.includes(':')) {
+    imageUrl = `${imageUrl}:latest`; // Add :latest if no tag
+  }
+  
+  try {
+    console.log(`📥 Checking AI service image: ${imageUrl}`);
+    
+    // Check if image exists locally
+    const images = await docker.listImages();
+    const localImage = images.find(img => {
+      if (!img.RepoTags) return false;
+      return img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
+    });
+    
+    if (localImage) {
+      console.log(`✅ AI service image found locally: ${imageUrl}`);
+      return;
+    }
+    
+    // Image not found locally, pull from ECR
+    console.log(`📥 AI service image not found locally, pulling from ECR: ${imageUrl}`);
+    
+    // Request ECR token from backend
+    const tokenData = await getECRPullToken(imageUrl);
+    if (!tokenData) {
+      throw new Error(`Failed to get ECR token from backend`);
+    }
+    
+    // Get auth config for Dockerode
+    const authConfig = getECRAuthConfig(tokenData);
+    
+    // Pull image
+    console.log(`📥 Pulling AI service image from ECR: ${imageUrl}`);
+    await new Promise((resolve, reject) => {
+      const pullOptions = {
+        authconfig: authConfig
+      };
+      
+      docker.pull(imageUrl, pullOptions, (err, stream) => {
+        if (err) {
+          console.error(`❌ Pull error:`, err.message);
+          return reject(err);
+        }
+        
+        docker.modem.followProgress(stream, (err, output) => {
+          if (err) {
+            console.error(`❌ Progress error:`, err.message);
+            return reject(err);
+          }
+          console.log(`✅ AI service image pulled successfully`);
+          resolve();
+        });
+      });
+    });
+  } catch (error) {
+    console.warn(`⚠️ Failed to pull AI service image: ${error.message}`);
+    // Don't fail startup if AI service image pull fails
+    // The image might be built locally or available via other means
+  }
+}
+
+/**
  * Main loop
  */
 async function main() {
