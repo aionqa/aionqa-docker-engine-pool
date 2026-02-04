@@ -561,7 +561,32 @@ async function updateHelperImage() {
     }
     
     const imageUrl = response.data.image_url;
+    const imageSha = response.data.image_sha;
     console.log(`📦 Helper image URL: ${imageUrl}`);
+    if (imageSha) {
+      console.log(`📦 Helper image SHA: ${imageSha.substring(0, 12)}...`);
+    }
+    
+    // Check if we need to update by comparing SHA
+    if (imageSha) {
+      try {
+        const images = await docker.listImages();
+        const localImage = images.find(img => {
+          if (!img.RepoTags) return false;
+          const matchesTag = img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
+          if (!matchesTag) return false;
+          // Check if SHA matches
+          return img.Id === imageSha || img.Id.startsWith(imageSha.replace('sha256:', ''));
+        });
+        
+        if (localImage) {
+          console.log(`✅ Helper image is up to date (SHA matches)`);
+          return; // Already up to date
+        }
+      } catch (checkError) {
+        console.warn(`⚠️ Could not check local helper image: ${checkError.message}, will pull`);
+      }
+    }
     
     // Get ECR token and pull latest image
     console.log(`📥 Pulling latest helper image from ECR: ${imageUrl}`);
@@ -594,6 +619,101 @@ async function updateHelperImage() {
     console.warn(`⚠️ Failed to update helper image: ${error.message}`);
     // Don't fail startup if helper update fails
   }
+}
+
+/**
+ * Check and update crawler image from ECR if newer version available
+ * Uses backend to get latest image URL and SHA
+ */
+async function checkCrawlerImage() {
+  try {
+    console.log(`🔄 Checking for crawler image updates...`);
+    
+    // Get crawler image URL from backend
+    const response = await axios.post(
+      `${BACKEND_URL}/api/docker-engines/image-url`,
+      { image_name: 'aionqa-unified-crawler:latest' },
+      { headers: getAuthHeaders(), timeout: 10000 }
+    );
+    
+    if (!response.data || !response.data.image_url) {
+      console.warn(`⚠️ Failed to get crawler image URL from backend`);
+      return;
+    }
+    
+    const imageUrl = response.data.image_url;
+    const imageSha = response.data.image_sha;
+    console.log(`📦 Crawler image URL: ${imageUrl}`);
+    if (imageSha) {
+      console.log(`📦 Crawler image SHA: ${imageSha.substring(0, 12)}...`);
+    }
+    
+    // Check if we need to update by comparing SHA
+    if (imageSha) {
+      try {
+        const images = await docker.listImages();
+        const localImage = images.find(img => {
+          if (!img.RepoTags) return false;
+          const matchesTag = img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
+          if (!matchesTag) return false;
+          // Check if SHA matches
+          return img.Id === imageSha || img.Id.startsWith(imageSha.replace('sha256:', ''));
+        });
+        
+        if (localImage) {
+          console.log(`✅ Crawler image is up to date (SHA matches)`);
+          return; // Already up to date
+        }
+      } catch (checkError) {
+        console.warn(`⚠️ Could not check local crawler image: ${checkError.message}, will pull`);
+      }
+    }
+    
+    // Image needs updating - pull from ECR
+    console.log(`📥 Pulling latest crawler image from ECR: ${imageUrl}`);
+    const tokenData = await getECRPullToken(imageUrl);
+    if (!tokenData) {
+      console.warn(`⚠️ Failed to get ECR token for crawler image`);
+      return;
+    }
+    
+    const authConfig = getECRAuthConfig(tokenData);
+    
+    await new Promise((resolve, reject) => {
+      docker.pull(imageUrl, { authconfig: authConfig }, (err, stream) => {
+        if (err) {
+          console.warn(`⚠️ Failed to pull crawler image: ${err.message}`);
+          return resolve(); // Don't fail on update
+        }
+        
+        docker.modem.followProgress(stream, (err, output) => {
+          if (err) {
+            console.warn(`⚠️ Crawler image pull progress error: ${err.message}`);
+            return resolve(); // Don't fail on update
+          }
+          console.log(`✅ Crawler image updated successfully`);
+          resolve();
+        });
+      });
+    });
+  } catch (error) {
+    console.warn(`⚠️ Failed to check crawler image: ${error.message}`);
+    // Don't fail if crawler image check fails
+  }
+}
+
+/**
+ * Check and update all images (helper, AI service, crawler)
+ * Called on startup, when job is received, and periodically
+ */
+async function checkAllImages() {
+  console.log(`🔄 Checking all images for updates...`);
+  await Promise.allSettled([
+    updateHelperImage(),
+    pullAIServiceImage(),
+    checkCrawlerImage()
+  ]);
+  console.log(`✅ Image check complete`);
 }
 
 /**
@@ -736,11 +856,8 @@ async function main() {
     console.warn(`⚠️  Engine registration failed - continuing with polling (engine may be pre-registered)`);
   }
 
-  // Check for helper image update on startup
-  await updateHelperImage();
-
-  // Pull AI service image from ECR if needed (using short-lived token)
-  await pullAIServiceImage();
+  // Check all images on startup
+  await checkAllImages();
 
   // Send heartbeat every 30 seconds
   setInterval(sendHeartbeat, 30000);
@@ -748,8 +865,8 @@ async function main() {
   // Cleanup containers every 5 minutes
   setInterval(cleanupContainers, 5 * 60 * 1000);
   
-  // Check for helper image updates every 12 hours
-  setInterval(updateHelperImage, IMAGE_UPDATE_INTERVAL);
+  // Check all images for updates every 12 hours
+  setInterval(checkAllImages, IMAGE_UPDATE_INTERVAL);
 
   // Main polling loop
   let pollCount = 0;
@@ -775,6 +892,11 @@ async function main() {
         console.log(`   Job type: ${job.job_type || 'unknown'}`);
         console.log(`   Image: ${job.image_url || 'unknown'}`);
         console.log(`   Full job object keys:`, Object.keys(job).join(', '));
+        
+        // Check all images for updates when job is received (non-blocking)
+        checkAllImages().catch(err => {
+          console.warn(`⚠️ Image check failed (non-blocking): ${err.message}`);
+        });
         
         // Start container - handle errors but don't block polling
         startCrawlerContainer(job)
