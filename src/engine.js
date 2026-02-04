@@ -545,20 +545,43 @@ const processingJobs = new Set();
  * Same mechanism as crawler images
  */
 async function pullAIServiceImage() {
-  const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://aionqa-ai-service:5000';
+  // Priority: 1. AI_SERVICE_IMAGE_URL env var, 2. Extract from AI_SERVICE_URL if ECR, 3. Get from backend
+  let imageUrl = process.env.AI_SERVICE_IMAGE_URL;
   
-  // Only pull if URL is an ECR URL
-  if (!aiServiceUrl.includes('.dkr.ecr.') && !aiServiceUrl.includes('amazonaws.com')) {
-    console.log(`ℹ️  AI Service URL is not ECR (${aiServiceUrl}), skipping image pull`);
-    return;
-  }
-  
-  // Extract image URL from AI_SERVICE_URL
-  // Format: http://778954507986.dkr.ecr.ap-southeast-2.amazonaws.com/aionqa-ai-service:latest
-  // Or: 778954507986.dkr.ecr.ap-southeast-2.amazonaws.com/aionqa-ai-service:latest
-  let imageUrl = aiServiceUrl.replace(/^https?:\/\//, ''); // Remove http:// or https://
-  if (!imageUrl.includes(':')) {
-    imageUrl = `${imageUrl}:latest`; // Add :latest if no tag
+  if (!imageUrl) {
+    const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://aionqa-ai-service:5000';
+    
+    // Check if AI_SERVICE_URL is an ECR URL
+    if (aiServiceUrl.includes('.dkr.ecr.') || aiServiceUrl.includes('amazonaws.com')) {
+      // Extract image URL from AI_SERVICE_URL
+      // Format: http://778954507986.dkr.ecr.ap-southeast-2.amazonaws.com/aionqa-ai-service:latest
+      imageUrl = aiServiceUrl.replace(/^https?:\/\//, ''); // Remove http:// or https://
+      if (!imageUrl.includes(':')) {
+        imageUrl = `${imageUrl}:latest`; // Add :latest if no tag
+      }
+    } else {
+      // Not an ECR URL, try to get image URL from backend
+      try {
+        console.log(`📥 Requesting AI service image URL from backend...`);
+        const response = await axios.post(
+          `${BACKEND_URL}/api/docker-engines/image-url`,
+          { image_name: 'aionqa-ai-service:latest' },
+          { headers: getAuthHeaders(), timeout: 10000 }
+        );
+        
+        if (response.data && response.data.image_url) {
+          imageUrl = response.data.image_url;
+          console.log(`✅ Got AI service image URL from backend: ${imageUrl}`);
+        } else {
+          console.log(`ℹ️  AI Service URL is not ECR (${aiServiceUrl}), and backend didn't provide image URL - skipping image pull`);
+          return;
+        }
+      } catch (error) {
+        console.warn(`⚠️ Failed to get AI service image URL from backend: ${error.message}`);
+        console.log(`ℹ️  Skipping AI service image pull (using local service or image already available)`);
+        return;
+      }
+    }
   }
   
   try {
