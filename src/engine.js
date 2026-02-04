@@ -36,6 +36,11 @@ console.log(`🐳 Docker Engine ID: ${ENGINE_ID}`);
 console.log(`🔗 Backend URL: ${BACKEND_URL}`);
 console.log(`⏱️  Poll interval: ${POLL_INTERVAL}ms`);
 console.log(`🔌 Docker socket: ${DOCKER_SOCKET}`);
+// Version info for image update verification
+const HELPER_VERSION = process.env.HELPER_VERSION || process.env.IMAGE_TAG || 'unknown';
+const HELPER_BUILD_DATE = process.env.BUILD_DATE || new Date().toISOString();
+console.log(`🏷️  Helper Version: ${HELPER_VERSION}`);
+console.log(`📅 Helper Build Date: ${HELPER_BUILD_DATE}`);
 
 // Initialize Docker client
 // Note: We'll set authconfig per-pull, not globally
