@@ -680,6 +680,9 @@ async function main() {
     console.warn(`⚠️  Engine registration failed - continuing with polling (engine may be pre-registered)`);
   }
 
+  // Check for helper image update on startup
+  await updateHelperImage();
+
   // Pull AI service image from ECR if needed (using short-lived token)
   await pullAIServiceImage();
 
@@ -689,8 +692,8 @@ async function main() {
   // Cleanup containers every 5 minutes
   setInterval(cleanupContainers, 5 * 60 * 1000);
   
-  // Helper image updates are handled externally (docker-compose, k8s, etc.)
-  // No need to check for updates here
+  // Check for helper image updates every 12 hours
+  setInterval(updateHelperImage, IMAGE_UPDATE_INTERVAL);
 
   // Main polling loop
   let pollCount = 0;
