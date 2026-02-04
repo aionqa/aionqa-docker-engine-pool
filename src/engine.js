@@ -417,6 +417,9 @@ async function startCrawlerContainer(job) {
       const error = containerInfo.State.Error || 'Unknown error';
       console.error(`❌ Container exited immediately with code ${exitCode}: ${error}`);
       
+      // Remove from processing set on error
+      processingJobs.delete(job_id);
+      
       // Try to get container logs
       try {
         const logs = await container.logs({ stdout: true, stderr: true, tail: 50 });
@@ -430,6 +433,9 @@ async function startCrawlerContainer(job) {
 
     // Track container
     runningContainers.set(container.id, job_id);
+    
+    // Remove from processing set once container is successfully started (job is now running)
+    processingJobs.delete(job_id);
 
     // Monitor container
     monitorContainer(container, job_id);
@@ -510,8 +516,13 @@ async function cleanupContainers() {
       if (containerInfo.State === 'exited' || containerInfo.State === 'dead') {
         try {
           const container = docker.getContainer(containerInfo.Id);
+          const jobId = runningContainers.get(containerInfo.Id);
           await container.remove();
           runningContainers.delete(containerInfo.Id);
+          // Also remove from processing set if it was there
+          if (jobId) {
+            processingJobs.delete(jobId);
+          }
           console.log(`🧹 Cleaned up container: ${containerInfo.Id.substring(0, 12)}`);
         } catch (error) {
           // Container might already be removed
@@ -525,6 +536,9 @@ async function cleanupContainers() {
 
 // Helper image updates are handled externally (docker-compose, k8s, etc.)
 // No need for helper to update itself
+
+// Track jobs currently being processed to prevent duplicate starts
+const processingJobs = new Set();
 
 /**
  * Main loop
@@ -575,6 +589,16 @@ async function main() {
       const job = await pollForJobs();
       
       if (job) {
+        // Check if this job is already being processed
+        if (processingJobs.has(job.job_id)) {
+          console.log(`⏭️  [MAIN LOOP] Job ${job.job_id} is already being processed, skipping...`);
+          await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+          continue;
+        }
+        
+        // Mark job as being processed
+        processingJobs.add(job.job_id);
+        
         console.log(`📋 [MAIN LOOP] Received job: ${job.job_id}`);
         console.log(`   Job type: ${job.job_type || 'unknown'}`);
         console.log(`   Image: ${job.image_url || 'unknown'}`);
@@ -586,8 +610,12 @@ async function main() {
         } catch (containerError) {
           console.error(`❌ [MAIN LOOP] Failed to start container for job ${job.job_id}:`, containerError.message);
           console.error(`   Stack:`, containerError.stack);
+          // Remove from processing set on error so it can be retried
+          processingJobs.delete(job.job_id);
           // Continue polling - don't crash the helper
         }
+        // Note: We don't remove from processingJobs on success because the job is now running
+        // The cleanup will happen when the container stops (handled elsewhere)
       } else {
         // Log occasionally when no jobs (every 12 polls = 1 minute)
         if (pollCount % 12 === 0) {
