@@ -9,8 +9,8 @@ on:
 env:
   AWS_REGION: ap-southeast-2
   ECR_REPOSITORY: aionqa-docker-engine-pool
-  # Private ECR registry (this account). Override by setting AWS_ACCOUNT_ID in repo secrets and building ECR_REGISTRY in a step if needed.
   ECR_REGISTRY: 778954507986.dkr.ecr.ap-southeast-2.amazonaws.com
+  ECR_PUBLIC_URI: public.ecr.aws/k0f6y3u1/aionqa-docker-engine-pool
 
 jobs:
   build-and-push:
@@ -55,8 +55,7 @@ jobs:
       - name: Push to ECR Public (no-login pull)
         run: |
           aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
-          PUBLIC_URI=$(aws ecr-public describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region us-east-1 --query 'repositories[0].repositoryUri' --output text)
-          echo "Pushing to ECR Public: $PUBLIC_URI"
-          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest $PUBLIC_URI:latest
-          docker push $PUBLIC_URI:latest
-          echo "✅ Helper image pushed to ECR Public: $PUBLIC_URI:latest"
+          echo "Pushing to ECR Public: ${{ env.ECR_PUBLIC_URI }}"
+          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest ${{ env.ECR_PUBLIC_URI }}:latest
+          docker push ${{ env.ECR_PUBLIC_URI }}:latest
+          echo "✅ Helper image pushed to ECR Public: ${{ env.ECR_PUBLIC_URI }}:latest"
