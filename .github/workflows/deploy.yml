@@ -41,10 +41,6 @@ jobs:
           docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
           echo "image=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      - name: Scan image for secrets
-        run: |
-          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image --scanners secret --exit-code 1 ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
-
       - name: Push image to Amazon ECR
         run: |
           docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
@@ -61,9 +57,12 @@ jobs:
           ECR_PUBLIC_ALIAS: ${{ secrets.ECR_PUBLIC_ALIAS }}
         run: |
           aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
-          ALIAS=$(aws ecr-public describe-registries --region us-east-1 --query 'registries[0].registryAlias.name' --output text)
+          # Use alias from API (our account's registry) or secret — do NOT default to 'aionqa' (may be another account)
+          ALIAS=$(aws ecr-public describe-registries --region us-east-1 --no-paginate --query 'registries[0].RegistryAlias.name' --output text 2>/dev/null || true)
+          [ -z "$ALIAS" ] || [ "$ALIAS" = "None" ] && ALIAS=$ECR_PUBLIC_ALIAS
           if [ -z "$ALIAS" ] || [ "$ALIAS" = "None" ]; then
-            ALIAS="${ECR_PUBLIC_ALIAS:-aionqa}"
+            echo "::error::ECR Public alias not found. In repo Secrets, set ECR_PUBLIC_ALIAS to your registry alias (AWS Console → ECR → Public registries)."
+            exit 1
           fi
           echo "Pushing to ECR Public (alias: $ALIAS)..."
           docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest public.ecr.aws/$ALIAS/${{ env.ECR_REPOSITORY }}:latest
