@@ -53,18 +53,10 @@ jobs:
           aws ecr-public create-repository --repository-name ${{ env.ECR_REPOSITORY }} --region us-east-1
 
       - name: Push to ECR Public (no-login pull)
-        env:
-          ECR_PUBLIC_ALIAS: ${{ secrets.ECR_PUBLIC_ALIAS }}
         run: |
           aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
-          # Use alias from API (our account's registry) or secret — do NOT default to 'aionqa' (may be another account)
-          ALIAS=$(aws ecr-public describe-registries --region us-east-1 --no-paginate --query 'registries[0].RegistryAlias.name' --output text 2>/dev/null || true)
-          [ -z "$ALIAS" ] || [ "$ALIAS" = "None" ] && ALIAS=$ECR_PUBLIC_ALIAS
-          if [ -z "$ALIAS" ] || [ "$ALIAS" = "None" ]; then
-            echo "::error::ECR Public alias not found. In repo Secrets, set ECR_PUBLIC_ALIAS to your registry alias (AWS Console → ECR → Public registries)."
-            exit 1
-          fi
-          echo "Pushing to ECR Public (alias: $ALIAS)..."
-          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest public.ecr.aws/$ALIAS/${{ env.ECR_REPOSITORY }}:latest
-          docker push public.ecr.aws/$ALIAS/${{ env.ECR_REPOSITORY }}:latest
-          echo "✅ Helper image pushed to ECR Public: public.ecr.aws/$ALIAS/${{ env.ECR_REPOSITORY }}:latest"
+          PUBLIC_URI=$(aws ecr-public describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region us-east-1 --query 'repositories[0].repositoryUri' --output text)
+          echo "Pushing to ECR Public: $PUBLIC_URI"
+          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest $PUBLIC_URI:latest
+          docker push $PUBLIC_URI:latest
+          echo "✅ Helper image pushed to ECR Public: $PUBLIC_URI:latest"
