@@ -32,25 +32,40 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image to Amazon ECR
+      - name: Build image
         id: build-image
         env:
           IMAGE_TAG: ${{ github.sha }}
         run: |
           docker build -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG .
-          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
           docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
-          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
           echo "image=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Scan image for secrets
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image --scanners secret --exit-code 1 ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+
+      - name: Push image to Amazon ECR
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
           echo "✅ Helper image pushed to ECR: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest"
+
+      - name: Ensure ECR Public repository exists
+        run: |
+          aws ecr-public describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --region us-east-1 2>/dev/null || \
+          aws ecr-public create-repository --repository-name ${{ env.ECR_REPOSITORY }} --region us-east-1
 
       - name: Push to ECR Public (no-login pull)
         env:
           ECR_PUBLIC_ALIAS: ${{ secrets.ECR_PUBLIC_ALIAS }}
         run: |
-          ALIAS="${ECR_PUBLIC_ALIAS:-aionqa}"
-          echo "Pushing to ECR Public (alias: $ALIAS)..."
           aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+          ALIAS=$(aws ecr-public describe-registries --region us-east-1 --query 'registries[0].registryAlias.name' --output text)
+          if [ -z "$ALIAS" ] || [ "$ALIAS" = "None" ]; then
+            ALIAS="${ECR_PUBLIC_ALIAS:-aionqa}"
+          fi
+          echo "Pushing to ECR Public (alias: $ALIAS)..."
           docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest public.ecr.aws/$ALIAS/${{ env.ECR_REPOSITORY }}:latest
           docker push public.ecr.aws/$ALIAS/${{ env.ECR_REPOSITORY }}:latest
           echo "✅ Helper image pushed to ECR Public: public.ecr.aws/$ALIAS/${{ env.ECR_REPOSITORY }}:latest"
