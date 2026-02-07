@@ -48,11 +48,9 @@ jobs:
         env:
           ECR_PUBLIC_ALIAS: ${{ secrets.ECR_PUBLIC_ALIAS }}
         run: |
-          if [ -z "$ECR_PUBLIC_ALIAS" ]; then
-            echo "ECR_PUBLIC_ALIAS not set, skipping ECR Public push"
-            exit 0
-          fi
+          ALIAS="${ECR_PUBLIC_ALIAS:-aionqa}"
+          echo "Pushing to ECR Public (alias: $ALIAS)..."
           aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
-          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest public.ecr.aws/$ECR_PUBLIC_ALIAS/${{ env.ECR_REPOSITORY }}:latest
-          docker push public.ecr.aws/$ECR_PUBLIC_ALIAS/${{ env.ECR_REPOSITORY }}:latest
-          echo "✅ Helper image pushed to ECR Public: public.ecr.aws/$ECR_PUBLIC_ALIAS/${{ env.ECR_REPOSITORY }}:latest"
+          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest public.ecr.aws/$ALIAS/${{ env.ECR_REPOSITORY }}:latest
+          docker push public.ecr.aws/$ALIAS/${{ env.ECR_REPOSITORY }}:latest
+          echo "✅ Helper image pushed to ECR Public: public.ecr.aws/$ALIAS/${{ env.ECR_REPOSITORY }}:latest"
