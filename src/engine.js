@@ -399,8 +399,8 @@ async function startCrawlerContainer(job) {
       Env: containerEnv,
       HostConfig: {
         ShmSize: 2147483648, // 2GB for Chromium
-        NetworkMode: 'aionqa-network', // Use the same network as helper (from docker-compose.helper.yml)
-        AutoRemove: false, // Keep containers for debugging (can be set to true in production)
+        NetworkMode: process.env.CRAWLER_NETWORK || 'aionqa-network',
+        AutoRemove: false, // Helper removes containers when not running (see monitorContainer + cleanupContainers)
         RestartPolicy: { Name: 'no' }, // Don't restart
         Binds: ['/var/run/docker.sock:/var/run/docker.sock'] // Mount docker socket for video recording
       },
@@ -432,7 +432,15 @@ async function startCrawlerContainer(job) {
       } catch (logError) {
         console.error(`Failed to get container logs:`, logError.message);
       }
-      
+
+      // Remove container so it does not stay on the host
+      try {
+        await container.remove();
+        console.log(`🧹 Removed failed container ${containerName}`);
+      } catch (removeError) {
+        console.warn(`⚠️ Failed to remove container: ${removeError.message}`);
+      }
+
       throw new Error(`Container exited immediately with code ${exitCode}: ${error}`);
     }
 
@@ -500,6 +508,14 @@ async function monitorContainer(container, jobId) {
         );
       } catch (error) {
         console.error(`⚠️ Failed to notify backend of container completion:`, error.message);
+      }
+
+      // Remove exited container so it does not stay on the host
+      try {
+        await container.remove();
+        console.log(`🧹 Removed exited container ${container.id.substring(0, 12)} for job ${jobId}`);
+      } catch (removeError) {
+        console.warn(`⚠️ Failed to remove exited container: ${removeError.message}`);
       }
     }
   } catch (error) {
@@ -721,102 +737,75 @@ async function checkAllImages() {
   console.log(`✅ Image check complete`);
 }
 
+/** Default container name for the AI service (helper starts it with short-lived ECR token) */
+const AI_SERVICE_CONTAINER_NAME = 'aionqa-ai-service';
+
 /**
- * Pull AI service image from ECR using short-lived token
- * Same mechanism as crawler images
- * Only pulls if AI_SERVICE env var is set to 'true'
+ * Resolve AI service image URL: env AI_SERVICE_IMAGE_URL, or from backend.
+ * Used for both pull and start. Returns null if not AI_SERVICE mode or URL unavailable.
+ */
+async function getAIServiceImageUrl() {
+  const aiServiceEnabled = process.env.AI_SERVICE === 'true' || process.env.AI_SERVICE === '1';
+  if (!aiServiceEnabled) return null;
+
+  let imageUrl = process.env.AI_SERVICE_IMAGE_URL;
+  if (imageUrl) return imageUrl;
+
+  try {
+    const response = await axios.post(
+      `${BACKEND_URL}/api/docker-engines/image-url`,
+      { image_name: 'aionqa-ai-service:latest' },
+      { headers: getAuthHeaders(), timeout: 10000 }
+    );
+    if (response.data && response.data.image_url) {
+      return response.data.image_url;
+    }
+  } catch (error) {
+    console.warn(`⚠️ Failed to get AI service image URL from backend: ${error.message}`);
+  }
+  // Fallback: common ECR URL
+  const region = process.env.AWS_REGION || 'ap-southeast-2';
+  const accountId = process.env.AWS_ACCOUNT_ID || '778954507986';
+  return `${accountId}.dkr.ecr.${region}.amazonaws.com/aionqa-ai-service:latest`;
+}
+
+/**
+ * Pull AI service image from ECR using short-lived token from backend.
+ * AI service is the common image; only the helper pulls it (with token), not the user.
  */
 async function pullAIServiceImage() {
-  // Only pull if AI_SERVICE is enabled
-  const aiServiceEnabled = process.env.AI_SERVICE === 'true' || process.env.AI_SERVICE === '1';
-  if (!aiServiceEnabled) {
+  const imageUrl = await getAIServiceImageUrl();
+  if (!imageUrl) {
     console.log(`ℹ️  AI_SERVICE not enabled, skipping AI service image pull`);
     return;
   }
-  // Priority: 1. AI_SERVICE_IMAGE_URL env var, 2. Extract from AI_SERVICE_URL if ECR, 3. Get from backend
-  let imageUrl = process.env.AI_SERVICE_IMAGE_URL;
-  
-  if (!imageUrl) {
-    const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://aionqa-ai-service:5000';
-    
-    // Check if AI_SERVICE_URL is an ECR URL
-    if (aiServiceUrl.includes('.dkr.ecr.') || aiServiceUrl.includes('amazonaws.com')) {
-      // Extract image URL from AI_SERVICE_URL
-      // Format: http://778954507986.dkr.ecr.ap-southeast-2.amazonaws.com/aionqa-ai-service:latest
-      imageUrl = aiServiceUrl.replace(/^https?:\/\//, ''); // Remove http:// or https://
-      if (!imageUrl.includes(':')) {
-        imageUrl = `${imageUrl}:latest`; // Add :latest if no tag
-      }
-    } else {
-      // Not an ECR URL, try to get image URL from backend
-      try {
-        console.log(`📥 Requesting AI service image URL from backend...`);
-        const response = await axios.post(
-          `${BACKEND_URL}/api/docker-engines/image-url`,
-          { image_name: 'aionqa-ai-service:latest' },
-          { headers: getAuthHeaders(), timeout: 10000 }
-        );
-        
-        if (response.data && response.data.image_url) {
-          imageUrl = response.data.image_url;
-          console.log(`✅ Got AI service image URL from backend: ${imageUrl}`);
-        } else {
-          console.log(`ℹ️  AI Service URL is not ECR (${aiServiceUrl}), and backend didn't provide image URL - skipping image pull`);
-          return;
-        }
-      } catch (error) {
-        console.warn(`⚠️ Failed to get AI service image URL from backend: ${error.message}`);
-        console.log(`ℹ️  Skipping AI service image pull (using local service or image already available)`);
-        return;
-      }
-    }
-  }
-  
+
   try {
     console.log(`📥 Checking AI service image: ${imageUrl}`);
-    
-    // Check if image exists locally
+
     const images = await docker.listImages();
     const localImage = images.find(img => {
       if (!img.RepoTags) return false;
       return img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
     });
-    
+
     if (localImage) {
       console.log(`✅ AI service image found locally: ${imageUrl}`);
       return;
     }
-    
-    // Image not found locally, pull from ECR
-    console.log(`📥 AI service image not found locally, pulling from ECR: ${imageUrl}`);
-    
-    // Request ECR token from backend
+
+    console.log(`📥 AI service image not found locally, pulling from ECR (short-lived token from backend)...`);
     const tokenData = await getECRPullToken(imageUrl);
     if (!tokenData) {
       throw new Error(`Failed to get ECR token from backend`);
     }
-    
-    // Get auth config for Dockerode
     const authConfig = getECRAuthConfig(tokenData);
-    
-    // Pull image
-    console.log(`📥 Pulling AI service image from ECR: ${imageUrl}`);
+
     await new Promise((resolve, reject) => {
-      const pullOptions = {
-        authconfig: authConfig
-      };
-      
-      docker.pull(imageUrl, pullOptions, (err, stream) => {
-        if (err) {
-          console.error(`❌ Pull error:`, err.message);
-          return reject(err);
-        }
-        
+      docker.pull(imageUrl, { authconfig: authConfig }, (err, stream) => {
+        if (err) return reject(err);
         docker.modem.followProgress(stream, (err, output) => {
-          if (err) {
-            console.error(`❌ Progress error:`, err.message);
-            return reject(err);
-          }
+          if (err) return reject(err);
           console.log(`✅ AI service image pulled successfully`);
           resolve();
         });
@@ -824,8 +813,55 @@ async function pullAIServiceImage() {
     });
   } catch (error) {
     console.warn(`⚠️ Failed to pull AI service image: ${error.message}`);
-    // Don't fail startup if AI service image pull fails
-    // The image might be built locally or available via other means
+  }
+}
+
+/**
+ * Start the AI service container (common image pulled by helper with short-lived token).
+ * Connects container to AI_SERVICE_NETWORK so helper can reach it at AI_SERVICE_URL.
+ */
+async function startAIServiceContainer() {
+  const aiServiceEnabled = process.env.AI_SERVICE === 'true' || process.env.AI_SERVICE === '1';
+  if (!aiServiceEnabled) return;
+
+  const imageUrl = await getAIServiceImageUrl();
+  if (!imageUrl) return;
+
+  const networkName = process.env.AI_SERVICE_NETWORK || 'aionqa-network';
+  try {
+    const containers = await docker.listContainers({ all: true });
+    const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === AI_SERVICE_CONTAINER_NAME));
+    if (existing) {
+      if (existing.State === 'running') {
+        console.log(`✅ AI service container already running: ${AI_SERVICE_CONTAINER_NAME}`);
+        return;
+      }
+      const oldContainer = docker.getContainer(existing.Id);
+      await oldContainer.remove({ force: true }).catch(() => {});
+    }
+
+    const env = [
+      `BACKEND_URL=${process.env.BACKEND_URL || 'https://api.aionqa.com'}`,
+      'AI_MODE=lm-studio',
+      `LM_STUDIO_URL=${process.env.AI_SERVICE_LM_STUDIO_URL || process.env.LM_STUDIO_URL || 'http://host.docker.internal:1234'}`,
+      'NODE_ENV=production'
+    ];
+
+    const container = await docker.createContainer({
+      Image: imageUrl,
+      name: AI_SERVICE_CONTAINER_NAME,
+      Env: env,
+      ExposedPorts: { '5000/tcp': {} },
+      HostConfig: {
+        PortBindings: { '5000/tcp': [{ HostPort: '5000' }] },
+        NetworkMode: networkName,
+        RestartPolicy: { Name: 'unless-stopped' }
+      }
+    });
+    await container.start();
+    console.log(`✅ AI service container started: ${AI_SERVICE_CONTAINER_NAME} on network ${networkName}`);
+  } catch (error) {
+    console.warn(`⚠️ Failed to start AI service container: ${error.message}`);
   }
 }
 
@@ -861,14 +897,17 @@ async function main() {
     console.warn(`⚠️  Engine registration failed - continuing with polling (engine may be pre-registered)`);
   }
 
-  // Check all images on startup
+  // Check all images on startup (helper + crawler; AI service image pulled with short-lived token)
   await checkAllImages();
+  // Start AI service container (common image; helper pulls it with token and runs it)
+  await startAIServiceContainer();
 
   // Send heartbeat every 30 seconds
   setInterval(sendHeartbeat, 30000);
 
-  // Cleanup containers every 5 minutes
-  setInterval(cleanupContainers, 5 * 60 * 1000);
+  // Clean up exited crawler containers so they are removed when not running (every 30s)
+  setInterval(cleanupContainers, 30 * 1000);
+  await cleanupContainers(); // run once on startup
   
   // Check all images for updates every 12 hours
   setInterval(checkAllImages, IMAGE_UPDATE_INTERVAL);

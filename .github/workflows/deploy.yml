@@ -1,4 +1,4 @@
-﻿name: Deploy Docker Engine Pool (Helper)
+name: Deploy Docker Engine Pool (Helper)
 
 on:
   push:
@@ -9,6 +9,8 @@ on:
 env:
   AWS_REGION: ap-southeast-2
   ECR_REPOSITORY: aionqa-docker-engine-pool
+  # Private ECR registry (this account). Override by setting AWS_ACCOUNT_ID in repo secrets and building ECR_REGISTRY in a step if needed.
+  ECR_REGISTRY: 778954507986.dkr.ecr.ap-southeast-2.amazonaws.com
 
 jobs:
   build-and-push:
@@ -33,19 +35,21 @@ jobs:
       - name: Build, tag, and push image to Amazon ECR
         id: build-image
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "✅ Helper image pushed to ECR: $ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          docker build -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG .
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest
+          echo "image=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "✅ Helper image pushed to ECR: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest"
 
-      - name: Make ECR repository public
+      - name: Push to ECR Public (no-login pull)
+        if: ${{ secrets.ECR_PUBLIC_ALIAS != '' }}
+        env:
+          ECR_PUBLIC_ALIAS: ${{ secrets.ECR_PUBLIC_ALIAS }}
         run: |
-          aws ecr set-repository-policy \
-            --repository-name ${{ env.ECR_REPOSITORY }} \
-            --policy-text '{"Version":"2012-10-17","Statement":[{"Sid":"PublicRead","Effect":"Allow","Principal":"*","Action":["ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","ecr:BatchCheckLayerAvailability"]}]}' \
-            --region ${{ env.AWS_REGION }}
+          aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+          docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest public.ecr.aws/$ECR_PUBLIC_ALIAS/${{ env.ECR_REPOSITORY }}:latest
+          docker push public.ecr.aws/$ECR_PUBLIC_ALIAS/${{ env.ECR_REPOSITORY }}:latest
+          echo "✅ Helper image pushed to ECR Public: public.ecr.aws/$ECR_PUBLIC_ALIAS/${{ env.ECR_REPOSITORY }}:latest"
