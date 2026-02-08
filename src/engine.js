@@ -943,7 +943,7 @@ async function fetchHelperConfig() {
   try {
     const response = await axios.get(
       `${BACKEND_URL}/api/docker-engines/config`,
-      { headers: getAuthHeaders(), timeout: 10000 }
+      { params: { engine_id: ENGINE_ID }, headers: getAuthHeaders(), timeout: 10000 }
     );
     if (response.data && response.data.config) {
       helperConfig = response.data.config;
