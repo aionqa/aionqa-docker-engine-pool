@@ -396,8 +396,13 @@ async function pollForJobs() {
       if (uptimeMs < MIN_UPTIME_BEFORE_SELF_UPDATE_MS) {
         console.log(`🔄 [POLL] Ignoring restart_requested (uptime ${Math.round(uptimeMs / 1000)}s < 2 min, avoid restart loop)`);
       } else {
-        console.log(`🔄 [POLL] Restart requested from UI; exiting so container can restart and pick up new config`);
-        process.exit(0);
+        console.log(`🔄 [POLL] Restart requested; updating helper image then exiting if update path is clear.`);
+        const result = await updateHelperImage();
+        if (result.safeToRestart) {
+          console.log(`🔄 [POLL] Exiting so container can restart with updated image.`);
+          process.exit(0);
+        }
+        console.warn(`⚠️ [POLL] Not exiting: restart requested but update unclear (${result.reason}); avoid indefinite restart.`);
       }
     }
     if (response.data && response.data.job) {
@@ -763,35 +768,29 @@ async function cleanupContainers() {
 const processingJobs = new Set();
 
 /**
- * Update helper image from ECR if newer version available
- * Uses short-lived token from backend
+ * Update helper image from ECR if newer version available.
+ * Uses short-lived token from backend. Requires image_sha from backend to avoid blind pulls.
+ * @returns {{ safeToRestart: true } | { safeToRestart: false, reason: string }}
  */
 async function updateHelperImage() {
   try {
     console.log(`🔄 Checking for helper image updates...`);
-    
-    // Get helper image URL from backend
     const response = await axios.post(
       `${BACKEND_URL}/api/docker-engines/image-url`,
       { image_name: 'aionqa-docker-engine-pool:latest' },
       { headers: getAuthHeaders(), timeout: 10000 }
     );
-    
     if (!response.data || !response.data.image_url) {
-      console.warn(`⚠️ Failed to get helper image URL from backend`);
-      return;
+      return { safeToRestart: false, reason: 'backend did not return image_url' };
     }
-    
     const imageUrl = response.data.image_url;
     const imageSha = response.data.image_sha;
     console.log(`📦 Helper image URL: ${imageUrl}`);
     if (!imageSha) {
       console.error(`❌ Error comparing SHA: backend did not return image_sha; skipping helper image update (no pull)`);
-      return;
+      return { safeToRestart: false, reason: 'backend did not return image_sha' };
     }
     console.log(`📦 Helper image SHA: ${imageSha.substring(0, 12)}...`);
-    
-    // Check if we need to update by comparing SHA
     try {
       const images = await docker.listImages();
       const localImage = images.find(img => {
@@ -804,43 +803,29 @@ async function updateHelperImage() {
       });
       if (localImage) {
         console.log(`✅ Helper image is up to date (SHA matches)`);
-        return;
+        return { safeToRestart: true };
       }
     } catch (checkError) {
       console.error(`❌ Error comparing SHA: ${checkError.message}; skipping helper image update (no pull)`);
-      return;
+      return { safeToRestart: false, reason: `error comparing SHA: ${checkError.message}` };
     }
-    
-    // Get ECR token and pull latest image
-    console.log(`📥 Pulling latest helper image from ECR: ${imageUrl}`);
     const tokenData = await getECRPullToken(imageUrl);
     if (!tokenData) {
       console.warn(`⚠️ Failed to get ECR token for helper image`);
-      return;
+      return { safeToRestart: false, reason: 'failed to get ECR token' };
     }
-    
     const authConfig = getECRAuthConfig(tokenData);
-    
     await new Promise((resolve, reject) => {
       docker.pull(imageUrl, { authconfig: authConfig }, (err, stream) => {
-        if (err) {
-          console.warn(`⚠️ Failed to pull helper image: ${err.message}`);
-          return resolve(); // Don't fail on update
-        }
-        
-        docker.modem.followProgress(stream, (err, output) => {
-          if (err) {
-            console.warn(`⚠️ Helper image pull progress error: ${err.message}`);
-            return resolve(); // Don't fail on update
-          }
-          console.log(`✅ Helper image updated successfully`);
-          resolve();
-        });
+        if (err) return reject(err);
+        docker.modem.followProgress(stream, (err, output) => (err ? reject(err) : resolve()));
       });
     });
+    console.log(`✅ Helper image updated successfully`);
+    return { safeToRestart: true };
   } catch (error) {
     console.warn(`⚠️ Failed to update helper image: ${error.message}`);
-    // Don't fail startup if helper update fails
+    return { safeToRestart: false, reason: error.message };
   }
 }
 
@@ -1389,39 +1374,16 @@ async function startAIServiceContainer() {
 }
 
 /**
- * Pull latest helper image then exit so host can restart with new image.
- * Uses ECR token from backend if HELPER_IMAGE is private ECR.
+ * Update helper image (backend URL + image_sha, pull only if needed) then exit only if update path was clear.
  */
 async function runHelperSelfUpdate() {
-  try {
-    console.log(`🔄 [SELF-UPDATE] Pulling helper image: ${HELPER_IMAGE}`);
-    const isPrivateEcr = HELPER_IMAGE.includes('.dkr.ecr.');
-    if (isPrivateEcr) {
-      const tokenData = await getECRPullToken(HELPER_IMAGE);
-      if (!tokenData) {
-        console.warn(`⚠️ [SELF-UPDATE] Could not get ECR token; pulling without auth may fail.`);
-      } else {
-        const authConfig = getECRAuthConfig(tokenData);
-        await new Promise((resolve, reject) => {
-          docker.pull(HELPER_IMAGE, { authconfig: authConfig }, (err, stream) => {
-            if (err) return reject(err);
-            docker.modem.followProgress(stream, (err) => (err ? reject(err) : resolve()));
-          });
-        });
-      }
-    } else {
-      await new Promise((resolve, reject) => {
-        docker.pull(HELPER_IMAGE, (err, stream) => {
-          if (err) return reject(err);
-          docker.modem.followProgress(stream, (err) => (err ? reject(err) : resolve()));
-        });
-      });
-    }
-    console.log(`✅ [SELF-UPDATE] Helper image pulled; exiting so host can restart.`);
-  } catch (e) {
-    console.warn(`⚠️ [SELF-UPDATE] Pull failed: ${e.message}; exiting anyway.`);
+  console.log(`🔄 [SELF-UPDATE] Updating helper image; will exit only if update path is clear.`);
+  const result = await updateHelperImage();
+  if (result.safeToRestart) {
+    console.log(`✅ [SELF-UPDATE] Helper image updated; exiting so host can restart.`);
+    process.exit(0);
   }
-  process.exit(0);
+  console.warn(`⚠️ [SELF-UPDATE] Not exiting: update unclear (${result.reason}); avoid indefinite restart.`);
 }
 
 /**
