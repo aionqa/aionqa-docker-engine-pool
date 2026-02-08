@@ -785,29 +785,30 @@ async function updateHelperImage() {
     const imageUrl = response.data.image_url;
     const imageSha = response.data.image_sha;
     console.log(`📦 Helper image URL: ${imageUrl}`);
-    if (imageSha) {
-      console.log(`📦 Helper image SHA: ${imageSha.substring(0, 12)}...`);
+    if (!imageSha) {
+      console.error(`❌ Error comparing SHA: backend did not return image_sha; skipping helper image update (no pull)`);
+      return;
     }
+    console.log(`📦 Helper image SHA: ${imageSha.substring(0, 12)}...`);
     
     // Check if we need to update by comparing SHA
-    if (imageSha) {
-      try {
-        const images = await docker.listImages();
-        const localImage = images.find(img => {
-          if (!img.RepoTags) return false;
-          const matchesTag = img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
-          if (!matchesTag) return false;
-          // Check if SHA matches
-          return img.Id === imageSha || img.Id.startsWith(imageSha.replace('sha256:', ''));
-        });
-        
-        if (localImage) {
-          console.log(`✅ Helper image is up to date (SHA matches)`);
-          return; // Already up to date
-        }
-      } catch (checkError) {
-        console.warn(`⚠️ Could not check local helper image: ${checkError.message}, will pull`);
+    try {
+      const images = await docker.listImages();
+      const localImage = images.find(img => {
+        if (!img.RepoTags) return false;
+        const matchesTag = img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
+        if (!matchesTag) return false;
+        const idNorm = (img.Id || '').replace(/^sha256:/, '');
+        const shaNorm = (imageSha || '').replace(/^sha256:/, '');
+        return idNorm === shaNorm || (idNorm && shaNorm && (idNorm.startsWith(shaNorm) || shaNorm.startsWith(idNorm)));
+      });
+      if (localImage) {
+        console.log(`✅ Helper image is up to date (SHA matches)`);
+        return;
       }
+    } catch (checkError) {
+      console.error(`❌ Error comparing SHA: ${checkError.message}; skipping helper image update (no pull)`);
+      return;
     }
     
     // Get ECR token and pull latest image
@@ -930,16 +931,18 @@ let lastCheckAllImagesTime = 0;
 const IMAGE_CHECK_THROTTLE_MS = 15 * 60 * 1000;
 
 /**
- * Check and update all images (helper, AI service, crawler)
- * Called on startup, when job is received (throttled), and every 12h
+ * Check and update all images (helper, AI service, crawler).
+ * Called on startup (skipHelper=true), when job is received (throttled), and every 12h.
+ * @param {boolean} skipHelper - If true, skip helper image check (avoid re-pulling the image we're already running on startup).
  */
-async function checkAllImages() {
+async function checkAllImages(skipHelper = false) {
   console.log(`🔄 Checking all images for updates...`);
-  await Promise.allSettled([
-    updateHelperImage(),
+  const tasks = [
+    ...(skipHelper ? [] : [updateHelperImage()]),
     pullAIServiceImage(),
     checkCrawlerImage()
-  ]);
+  ];
+  await Promise.allSettled(tasks);
   console.log(`✅ Image check complete`);
   lastCheckAllImagesTime = Date.now();
 }
@@ -1555,8 +1558,8 @@ async function main() {
   await fetchHelperConfig().catch(err => console.warn('⚠️ Initial config fetch failed (will retry in reconcile):', err.message));
   // Ensure network exists (for AI service and optional Ollama)
   await ensureAionqaNetwork().catch(err => console.warn('⚠️ Ensure network failed:', err.message));
-  // Check all images on startup (helper + crawler; AI service image pulled with short-lived token)
-  await checkAllImages();
+  // Check images on startup; skip helper image so we don't re-pull the 3.2 GB image we're already running (12h interval will check helper later)
+  await checkAllImages(true);
   // Apply service state from config (Ollama and AI service: start or stop/remove to match UI toggles). Always run so services start even if earlier steps had issues.
   await reconcileServices();
 
