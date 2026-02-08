@@ -778,28 +778,27 @@ async function updateHelperImage() {
     const imageUrl = response.data.image_url;
     const imageSha = response.data.image_sha;
     console.log(`📦 Helper image URL: ${imageUrl}`);
-    if (!imageSha) {
-      console.error(`❌ Error comparing SHA: backend did not return image_sha; skipping helper image update (no pull)`);
-      return { safeToRestart: false, reason: 'backend did not return image_sha' };
-    }
-    console.log(`📦 Helper image SHA: ${imageSha.substring(0, 12)}...`);
-    try {
-      const images = await docker.listImages();
-      const localImage = images.find(img => {
-        if (!img.RepoTags) return false;
-        const matchesTag = img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
-        if (!matchesTag) return false;
-        const idNorm = (img.Id || '').replace(/^sha256:/, '');
-        const shaNorm = (imageSha || '').replace(/^sha256:/, '');
-        return idNorm === shaNorm || (idNorm && shaNorm && (idNorm.startsWith(shaNorm) || shaNorm.startsWith(idNorm)));
-      });
-      if (localImage) {
-        console.log(`✅ Helper image is up to date (SHA matches)`);
-        return { safeToRestart: true };
+    if (imageSha) {
+      console.log(`📦 Helper image SHA: ${imageSha.substring(0, 12)}...`);
+      try {
+        const images = await docker.listImages();
+        const localImage = images.find(img => {
+          if (!img.RepoTags) return false;
+          const matchesTag = img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
+          if (!matchesTag) return false;
+          const idNorm = (img.Id || '').replace(/^sha256:/, '');
+          const shaNorm = (imageSha || '').replace(/^sha256:/, '');
+          return idNorm === shaNorm || (idNorm && shaNorm && (idNorm.startsWith(shaNorm) || shaNorm.startsWith(idNorm)));
+        });
+        if (localImage) {
+          console.log(`✅ Helper image is up to date (SHA matches)`);
+          return { safeToRestart: true };
+        }
+      } catch (checkError) {
+        console.error(`❌ Error comparing SHA: ${checkError.message}; skipping SHA check, will pull`);
       }
-    } catch (checkError) {
-      console.error(`❌ Error comparing SHA: ${checkError.message}; skipping helper image update (no pull)`);
-      return { safeToRestart: false, reason: `error comparing SHA: ${checkError.message}` };
+    } else {
+      console.warn(`⚠️ Backend did not return image_sha; pulling image to update (no skip-if-current check)`);
     }
     const tokenData = await getECRPullToken(imageUrl);
     if (!tokenData) {
