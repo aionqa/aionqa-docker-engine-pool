@@ -59,19 +59,3 @@ jobs:
           docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest ${{ env.ECR_PUBLIC_URI }}:latest
           docker push ${{ env.ECR_PUBLIC_URI }}:latest
           echo "✅ Helper image pushed to ECR Public: ${{ env.ECR_PUBLIC_URI }}:latest"
-
-      - name: Notify backend to update clients' helpers
-        if: success()
-        env:
-          NOTIFY_SECRET: ${{ secrets.NOTIFY_NEW_IMAGE_SECRET }}
-        run: |
-          if [ -z "$NOTIFY_SECRET" ]; then
-            echo "NOTIFY_NEW_IMAGE_SECRET not set; skipping notify."
-            exit 0
-          fi
-          API_URL="${AIONQA_API_URL:-https://api.aionqa.com}"
-          curl -sS -X POST "$API_URL/api/docker-engines/notify-new-image" \
-            -H "Content-Type: application/json" \
-            -H "X-Notify-New-Image-Secret: $NOTIFY_SECRET" \
-            -d '{"image":"aionqa-docker-engine-pool"}' || true
-          echo "✅ Notified backend (helpers will restart on next poll)."

@@ -18,6 +18,9 @@ const ENGINE_ID = process.env.ENGINE_ID || `docker-engine-${hostname()}-${random
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '5000'); // 5 seconds
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 const IMAGE_UPDATE_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours in milliseconds
+/** Process start time (ms) - used to skip helper self-update right after restart to avoid loop */
+const processStartTime = Date.now();
+const MIN_UPTIME_BEFORE_SELF_UPDATE_MS = 2 * 60 * 1000; // 2 minutes
 
 // ECR repositories are public - no AWS credentials needed
 // Helper uses ENGINE_TOKEN (project credentials) for backend authentication only
@@ -389,8 +392,13 @@ async function pollForJobs() {
     console.log(`[POLL] Response data:`, JSON.stringify(response.data).substring(0, 500));
 
     if (response.data && response.data.restart_requested) {
-      console.log(`🔄 [POLL] Restart requested from UI; exiting so container can restart and pick up new config`);
-      process.exit(0);
+      const uptimeMs = Date.now() - processStartTime;
+      if (uptimeMs < MIN_UPTIME_BEFORE_SELF_UPDATE_MS) {
+        console.log(`🔄 [POLL] Ignoring restart_requested (uptime ${Math.round(uptimeMs / 1000)}s < 2 min, avoid restart loop)`);
+      } else {
+        console.log(`🔄 [POLL] Restart requested from UI; exiting so container can restart and pick up new config`);
+        process.exit(0);
+      }
     }
     if (response.data && response.data.job) {
       console.log(`📥 [POLL] Received job from backend: ${response.data.job.job_id}`);
@@ -1495,7 +1503,12 @@ async function runPendingContainerActions() {
       );
     }
     if (selfUpdateRequested) {
-      await runHelperSelfUpdate();
+      const uptimeMs = Date.now() - processStartTime;
+      if (uptimeMs < MIN_UPTIME_BEFORE_SELF_UPDATE_MS) {
+        console.log(`🔄 [SELF-UPDATE] Skipping helper update (uptime ${Math.round(uptimeMs / 1000)}s < 2 min, avoid restart loop)`);
+      } else {
+        await runHelperSelfUpdate();
+      }
     }
   } catch (err) {
     if (err.response?.status === 404) {
