@@ -39,6 +39,8 @@ console.log(`🔌 Docker socket: ${DOCKER_SOCKET}`);
 // Version info for image update verification
 const HELPER_VERSION = process.env.HELPER_VERSION || process.env.IMAGE_TAG || 'unknown';
 const HELPER_BUILD_DATE = process.env.BUILD_DATE || new Date().toISOString();
+const HELPER_CONTAINER_NAME = (process.env.HELPER_CONTAINER_NAME || process.env.CONTAINER_NAME || 'aionqa-helper').toLowerCase().replace(/^\//, '');
+const HELPER_IMAGE = process.env.HELPER_IMAGE || 'public.ecr.aws/k0f6y3u1/aionqa-docker-engine-pool:latest';
 console.log(`🏷️  Helper Version: ${HELPER_VERSION}`);
 console.log(`📅 Helper Build Date: ${HELPER_BUILD_DATE}`);
 
@@ -1233,8 +1235,9 @@ async function getAIServiceImageUrl() {
 /**
  * Pull AI service image from ECR using short-lived token from backend.
  * AI service is the common image; only the helper pulls it (with token), not the user.
+ * @param {boolean} forcePull - If true, always pull (get token and pull); used on Update so latest image is used.
  */
-async function pullAIServiceImage() {
+async function pullAIServiceImage(forcePull = false) {
   const imageUrl = await getAIServiceImageUrl();
   if (!imageUrl) {
     console.log(`ℹ️  AI_SERVICE not enabled, skipping AI service image pull`);
@@ -1242,20 +1245,20 @@ async function pullAIServiceImage() {
   }
 
   try {
-    console.log(`📥 Checking AI service image: ${imageUrl}`);
-
-    const images = await docker.listImages();
-    const localImage = images.find(img => {
-      if (!img.RepoTags) return false;
-      return img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
-    });
-
-    if (localImage) {
-      console.log(`✅ AI service image found locally: ${imageUrl}`);
-      return;
+    if (!forcePull) {
+      console.log(`📥 Checking AI service image: ${imageUrl}`);
+      const images = await docker.listImages();
+      const localImage = images.find(img => {
+        if (!img.RepoTags) return false;
+        return img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
+      });
+      if (localImage) {
+        console.log(`✅ AI service image found locally: ${imageUrl}`);
+        return;
+      }
     }
 
-    console.log(`📥 AI service image not found locally, pulling from ECR (short-lived token from backend)...`);
+    console.log(`📥 Pulling AI service image from ECR (token from backend)...`);
     const tokenData = await getECRPullToken(imageUrl);
     if (!tokenData) {
       throw new Error(`Failed to get ECR token from backend`);
@@ -1367,6 +1370,42 @@ async function startAIServiceContainer() {
 }
 
 /**
+ * Pull latest helper image then exit so host can restart with new image.
+ * Uses ECR token from backend if HELPER_IMAGE is private ECR.
+ */
+async function runHelperSelfUpdate() {
+  try {
+    console.log(`🔄 [SELF-UPDATE] Pulling helper image: ${HELPER_IMAGE}`);
+    const isPrivateEcr = HELPER_IMAGE.includes('.dkr.ecr.');
+    if (isPrivateEcr) {
+      const tokenData = await getECRPullToken(HELPER_IMAGE);
+      if (!tokenData) {
+        console.warn(`⚠️ [SELF-UPDATE] Could not get ECR token; pulling without auth may fail.`);
+      } else {
+        const authConfig = getECRAuthConfig(tokenData);
+        await new Promise((resolve, reject) => {
+          docker.pull(HELPER_IMAGE, { authconfig: authConfig }, (err, stream) => {
+            if (err) return reject(err);
+            docker.modem.followProgress(stream, (err) => (err ? reject(err) : resolve()));
+          });
+        });
+      }
+    } else {
+      await new Promise((resolve, reject) => {
+        docker.pull(HELPER_IMAGE, (err, stream) => {
+          if (err) return reject(err);
+          docker.modem.followProgress(stream, (err) => (err ? reject(err) : resolve()));
+        });
+      });
+    }
+    console.log(`✅ [SELF-UPDATE] Helper image pulled; exiting so host can restart.`);
+  } catch (e) {
+    console.warn(`⚠️ [SELF-UPDATE] Pull failed: ${e.message}; exiting anyway.`);
+  }
+  process.exit(0);
+}
+
+/**
  * Run pending container actions from the backend (stop/start/remove/update). Helper polls, executes, then acks.
  */
 async function runPendingContainerActions() {
@@ -1379,6 +1418,7 @@ async function runPendingContainerActions() {
     if (pending.length === 0) return;
     console.log(`[CONTAINER-ACTIONS] Executing ${pending.length} pending action(s):`, pending.map(p => ({ action: p.action, container: p.container_name })));
     const executedIds = [];
+    let selfUpdateRequested = false;
     for (const { id: actionId, container_name: name, action } of pending) {
       const normalizedName = (name || '').replace(/^\//, '').toLowerCase();
       try {
@@ -1412,13 +1452,18 @@ async function runPendingContainerActions() {
             console.log(`▶️ Started container: ${name}`);
           }
         } else if (action === 'update') {
-          if (normalizedName.includes('ollama')) {
+          if (normalizedName === HELPER_CONTAINER_NAME || normalizedName.includes('aionqa-helper')) {
+            executedIds.push(actionId);
+            selfUpdateRequested = true;
+            console.log(`🔄 [SELF-UPDATE] Update requested for helper; will pull image and exit.`);
+          } else if (normalizedName.includes('ollama')) {
             await stopAndRemoveOllamaContainer();
             await startOllamaContainer();
             console.log(`🔄 Updated Ollama`);
           } else if (normalizedName.includes('aionqa-ai-service')) {
+            await fetchHelperConfig();
             await stopAndRemoveAIServiceContainer();
-            await pullAIServiceImage();
+            await pullAIServiceImage(true);
             await startAIServiceContainer();
             console.log(`🔄 Updated AI service`);
           } else if (found) {
@@ -1428,7 +1473,7 @@ async function runPendingContainerActions() {
             console.log(`🔄 Removed container for update: ${name} (recreate not implemented for generic containers)`);
           }
         }
-        executedIds.push(actionId);
+        if (!selfUpdateRequested) executedIds.push(actionId);
       } catch (err) {
         console.warn(`⚠️ Failed to run action ${action} on ${name}:`, err.message);
         executedIds.push(actionId);
@@ -1440,6 +1485,9 @@ async function runPendingContainerActions() {
         { ids: executedIds },
         { headers: getAuthHeaders(), timeout: 5000 }
       );
+    }
+    if (selfUpdateRequested) {
+      await runHelperSelfUpdate();
     }
   } catch (err) {
     if (err.response?.status === 404) {
