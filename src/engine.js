@@ -1356,9 +1356,10 @@ async function runPendingContainerActions() {
     );
     const pending = response.data?.pending || [];
     if (pending.length === 0) return;
+    console.log(`[CONTAINER-ACTIONS] Executing ${pending.length} pending action(s):`, pending.map(p => ({ action: p.action, container: p.container_name })));
     const executedIds = [];
     for (const { id: actionId, container_name: name, action } of pending) {
-      const normalizedName = name.replace(/^\//, '').toLowerCase();
+      const normalizedName = (name || '').replace(/^\//, '').toLowerCase();
       try {
         const containers = await docker.listContainers({ all: true });
         const found = containers.find(c =>
@@ -1420,7 +1421,11 @@ async function runPendingContainerActions() {
       );
     }
   } catch (err) {
-    console.warn(`⚠️ Pending container actions: ${err.message}`);
+    if (err.response?.status === 404) {
+      console.warn(`[CONTAINER-ACTIONS] Pending actions 404 - engine_id=${ENGINE_ID} may not match token's runner`);
+    } else {
+      console.warn(`[CONTAINER-ACTIONS] Pending container actions: ${err.message}`);
+    }
   }
 }
 
@@ -1457,13 +1462,20 @@ async function main() {
   }
 
   // Fetch helper config from API (UI-editable; env overrides)
-  await fetchHelperConfig();
+  await fetchHelperConfig().catch(err => console.warn('⚠️ Initial config fetch failed (will retry in reconcile):', err.message));
   // Ensure network exists (for AI service and optional Ollama)
-  await ensureAionqaNetwork();
+  await ensureAionqaNetwork().catch(err => console.warn('⚠️ Ensure network failed:', err.message));
   // Check all images on startup (helper + crawler; AI service image pulled with short-lived token)
   await checkAllImages();
-  // Apply service state from config (Ollama and AI service: start or stop/remove to match UI toggles)
+  // Apply service state from config (Ollama and AI service: start or stop/remove to match UI toggles). Always run so services start even if earlier steps had issues.
   await reconcileServices();
+
+  // Retry reconcile once after delay so Ollama/AI service start even if first run had transient failures (config not ready, image pull slow, etc.)
+  const STARTUP_RECONCILE_DELAY_MS = 25 * 1000;
+  setTimeout(() => {
+    console.log(`🔄 [STARTUP] Retrying reconcile (Ollama / AI service) after ${STARTUP_RECONCILE_DELAY_MS / 1000}s...`);
+    reconcileServices().catch(err => console.warn('⚠️ [STARTUP] Delayed reconcile failed:', err.message));
+  }, STARTUP_RECONCILE_DELAY_MS);
 
   // Send heartbeat every 30 seconds
   setInterval(sendHeartbeat, 30000);
