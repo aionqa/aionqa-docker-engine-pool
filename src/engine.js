@@ -1026,17 +1026,21 @@ async function pullOllamaImage() {
 
 /**
  * LM Studio–matching params for Ollama. From API config or env.
+ * OLLAMA_MAX_VRAM caps GPU memory so Ollama uses system RAM for the rest (e.g. 7G for 8 GB GPU).
  */
 function getOllamaEnv() {
   const c = helperConfig || {};
-  return [
+  const env = [
     `OLLAMA_NUM_PARALLEL=${process.env.OLLAMA_NUM_PARALLEL ?? c.ollama_num_parallel ?? '1'}`,
-    `OLLAMA_MAX_LOADED_MODELS=${process.env.OLLAMA_MAX_LOADED_MODELS || '1'}`,
+    `OLLAMA_MAX_LOADED_MODELS=${process.env.OLLAMA_MAX_LOADED_MODELS ?? c.ollama_max_loaded_models ?? '1'}`,
     `OLLAMA_KEEP_ALIVE=${process.env.OLLAMA_KEEP_ALIVE ?? c.ollama_keep_alive ?? '24h'}`,
     `OLLAMA_MAX_QUEUE=${process.env.OLLAMA_MAX_QUEUE ?? c.ollama_max_queue ?? '512'}`,
     `OLLAMA_CONTEXT_LENGTH=${process.env.OLLAMA_CONTEXT_LENGTH ?? c.ollama_context_length ?? '128000'}`,
     `OLLAMA_NUM_THREADS=${process.env.OLLAMA_NUM_THREADS ?? c.ollama_num_threads ?? '12'}`
   ];
+  const maxVram = process.env.OLLAMA_MAX_VRAM || c.ollama_max_vram;
+  if (maxVram) env.push(`OLLAMA_MAX_VRAM=${String(maxVram).trim()}`);
+  return env;
 }
 
 /**
@@ -1066,6 +1070,12 @@ async function startOllamaContainer() {
       PortBindings: { '11434/tcp': [{ HostPort: '11434' }] },
       Binds: ['ollama-models:/root/.ollama']
     };
+    const memGb = process.env.OLLAMA_MEMORY_GB || process.env.OLLAMA_CONTAINER_MEMORY_GB || (helperConfig && helperConfig.ollama_memory_gb != null && helperConfig.ollama_memory_gb !== '' ? helperConfig.ollama_memory_gb : null);
+    if (memGb != null && memGb !== '' && /^\d+$/.test(String(memGb).trim())) {
+      const bytes = Math.floor(Number(memGb) * 1024 * 1024 * 1024);
+      hostConfig.Memory = bytes;
+      console.log(`📦 Ollama container memory limit: ${memGb} GB`);
+    }
     if (process.env.OLLAMA_GPU !== '0' && process.env.OLLAMA_GPU !== 'false') {
       hostConfig.DeviceRequests = [
         { Driver: 'nvidia', Count: -1, Capabilities: [['gpu']] }
