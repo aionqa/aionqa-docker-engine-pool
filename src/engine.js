@@ -1335,11 +1335,11 @@ async function startAIServiceContainer() {
     const containers = await docker.listContainers({ all: true });
     const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === AI_SERVICE_CONTAINER_NAME));
     if (existing) {
-      if (existing.State === 'running') {
-        console.log(`✅ AI service container already running: ${AI_SERVICE_CONTAINER_NAME}`);
-        return;
-      }
       const oldContainer = docker.getContainer(existing.Id);
+      if (existing.State === 'running') {
+        console.log(`🔄 Recreating AI service container to apply config (e.g. provider change)...`);
+        await oldContainer.stop({ t: 10 }).catch(() => {});
+      }
       await oldContainer.remove({ force: true }).catch(() => {});
     }
 
