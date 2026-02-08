@@ -5,7 +5,7 @@
 
 import Docker from 'dockerode';
 import axios from 'axios';
-import { hostname } from 'os';
+import { hostname, cpus } from 'os';
 import { randomUUID } from 'crypto';
 // execAsync no longer needed - ECR authentication removed
 
@@ -292,8 +292,10 @@ async function collectRunnerMetrics() {
   };
   try {
     const info = await docker.info();
+    const dockerNcpu = info.NCPU != null ? info.NCPU : 0;
+    const hostLogicalCpus = (typeof cpus === 'function' ? cpus() : []).length;
     out.host = {
-      ncpu: info.NCPU || null,
+      ncpu: Math.max(dockerNcpu, hostLogicalCpus) || null,
       memory_total_bytes: info.MemTotal != null ? info.MemTotal : null,
       memory_used_bytes: info.MemoryLimit && info.MemoryLimit === false ? null : (info.MemTotal != null ? Math.max(0, info.MemTotal - (info.MemAvailable != null ? info.MemAvailable : 0)) : null)
     };
