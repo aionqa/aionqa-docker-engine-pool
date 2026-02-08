@@ -590,7 +590,7 @@ async function startCrawlerContainer(job) {
       Env: containerEnv,
       HostConfig: {
         ShmSize: 2147483648, // 2GB for Chromium
-        NetworkMode: process.env.CRAWLER_NETWORK || 'aionqa-network',
+        NetworkMode: (helperConfig && helperConfig.crawler_network) || process.env.CRAWLER_NETWORK || 'aionqa-network',
         AutoRemove: false, // Helper removes containers when not running (see monitorContainer + cleanupContainers)
         RestartPolicy: { Name: 'no' }, // Don't restart
         Binds: ['/var/run/docker.sock:/var/run/docker.sock'] // Mount docker socket for video recording
@@ -990,11 +990,16 @@ function getOllamaModel() {
   return 'qwen2.5vl:3b';
 }
 
+function getConfigNetwork() {
+  if (helperConfig && helperConfig.ai_service_network) return helperConfig.ai_service_network;
+  return process.env.AI_SERVICE_NETWORK || 'aionqa-network';
+}
+
 /**
  * Ensure aionqa-network exists (for AI service and Ollama). Create if missing.
  */
 async function ensureAionqaNetwork() {
-  const networkName = process.env.AI_SERVICE_NETWORK || 'aionqa-network';
+  const networkName = getConfigNetwork();
   try {
     const networks = await docker.listNetworks();
     const exists = networks.some(n => n.Name === networkName);
@@ -1053,7 +1058,7 @@ function getOllamaEnv() {
  */
 async function startOllamaContainer() {
   if (!isOllamaEnabled()) return;
-  const networkName = process.env.AI_SERVICE_NETWORK || 'aionqa-network';
+  const networkName = getConfigNetwork();
   const model = getOllamaModel();
   try {
     await pullOllamaImage();
@@ -1301,7 +1306,7 @@ async function startAIServiceContainer() {
 
   await pullAIServiceImage();
 
-  const networkName = process.env.AI_SERVICE_NETWORK || 'aionqa-network';
+  const networkName = getConfigNetwork();
   const lmStudioUrl = getLMStudioUrl();
   try {
     const containers = await docker.listContainers({ all: true });
@@ -1337,6 +1342,85 @@ async function startAIServiceContainer() {
     console.log(`✅ AI service container started: ${AI_SERVICE_CONTAINER_NAME} on network ${networkName}`);
   } catch (error) {
     console.warn(`⚠️ Failed to start AI service container: ${error.message}`);
+  }
+}
+
+/**
+ * Run pending container actions from the backend (stop/start/remove/update). Helper polls, executes, then acks.
+ */
+async function runPendingContainerActions() {
+  try {
+    const response = await axios.get(
+      `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/pending-actions`,
+      { headers: getAuthHeaders(), timeout: 5000 }
+    );
+    const pending = response.data?.pending || [];
+    if (pending.length === 0) return;
+    const executedIds = [];
+    for (const { id: actionId, container_name: name, action } of pending) {
+      const normalizedName = name.replace(/^\//, '').toLowerCase();
+      try {
+        const containers = await docker.listContainers({ all: true });
+        const found = containers.find(c =>
+          (c.Names || []).some(n => n.replace(/^\//, '').toLowerCase() === normalizedName || n.replace(/^\//, '').toLowerCase().includes(normalizedName))
+        );
+        if (action === 'stop') {
+          if (found) {
+            const container = docker.getContainer(found.Id);
+            await container.stop({ t: 10 }).catch(() => {});
+            console.log(`🛑 Stopped container: ${name}`);
+          }
+        } else if (action === 'remove') {
+          if (found) {
+            const container = docker.getContainer(found.Id);
+            if (found.State === 'running') await container.stop({ t: 10 }).catch(() => {});
+            await container.remove({ force: true }).catch(() => {});
+            console.log(`🗑️ Removed container: ${name}`);
+          }
+        } else if (action === 'start') {
+          if (normalizedName.includes('ollama')) {
+            await startOllamaContainer();
+            console.log(`▶️ Started Ollama`);
+          } else if (normalizedName.includes('aionqa-ai-service')) {
+            await startAIServiceContainer();
+            console.log(`▶️ Started AI service`);
+          } else if (found) {
+            const container = docker.getContainer(found.Id);
+            await container.start();
+            console.log(`▶️ Started container: ${name}`);
+          }
+        } else if (action === 'update') {
+          if (normalizedName.includes('ollama')) {
+            await stopAndRemoveOllamaContainer();
+            await startOllamaContainer();
+            console.log(`🔄 Updated Ollama`);
+          } else if (normalizedName.includes('aionqa-ai-service')) {
+            await stopAndRemoveAIServiceContainer();
+            await pullAIServiceImage();
+            await startAIServiceContainer();
+            console.log(`🔄 Updated AI service`);
+          } else if (found) {
+            const container = docker.getContainer(found.Id);
+            if (found.State === 'running') await container.stop({ t: 10 }).catch(() => {});
+            await container.remove({ force: true }).catch(() => {});
+            console.log(`🔄 Removed container for update: ${name} (recreate not implemented for generic containers)`);
+          }
+        }
+        executedIds.push(actionId);
+      } catch (err) {
+        console.warn(`⚠️ Failed to run action ${action} on ${name}:`, err.message);
+        executedIds.push(actionId);
+      }
+    }
+    if (executedIds.length > 0) {
+      await axios.post(
+        `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/pending-actions/ack`,
+        { ids: executedIds },
+        { headers: getAuthHeaders(), timeout: 5000 }
+      );
+    }
+  } catch (err) {
+    console.warn(`⚠️ Pending container actions: ${err.message}`);
   }
 }
 
@@ -1397,6 +1481,7 @@ async function main() {
   let pollCount = 0;
   while (true) {
     try {
+      runPendingContainerActions().catch(() => {});
       pollCount++;
       const job = await pollForJobs();
       
