@@ -943,14 +943,16 @@ async function fetchHelperConfig() {
 
 /**
  * Use Ollama as LLM backend (default). Set use_lm_studio_host (API) or USE_LM_STUDIO_HOST (env) to use host LM Studio.
+ * When config has not been loaded yet, return false so we do not start Ollama (avoids starting Ollama when user selected LM Studio but config fetch failed or was delayed).
  */
 function useOllamaAsLLM() {
   if (process.env.USE_LM_STUDIO_HOST !== undefined) {
     return process.env.USE_LM_STUDIO_HOST !== 'true' && process.env.USE_LM_STUDIO_HOST !== '1';
   }
-  const provider = helperConfig?.ai_service_provider || 'ollama';
+  if (!helperConfig) return false; // No config loaded yet - do not start Ollama; reconcileServices will retry fetch
+  const provider = helperConfig.ai_service_provider || 'ollama';
   if (provider === 'lm_studio' || provider === 'openai') return false;
-  if (helperConfig && helperConfig.use_lm_studio_host === true) return false;
+  if (helperConfig.use_lm_studio_host === true) return false;
   return true;
 }
 
@@ -1434,8 +1436,13 @@ async function runPendingContainerActions() {
           }
         } else if (action === 'start') {
           if (normalizedName.includes('ollama')) {
-            await startOllamaContainer();
-            console.log(`▶️ Started Ollama`);
+            await fetchHelperConfig();
+            if (isOllamaEnabled()) {
+              await startOllamaContainer();
+              console.log(`▶️ Started Ollama`);
+            } else {
+              console.log(`⏭️ Skipping start Ollama: config says use LM Studio / OpenAI`);
+            }
           } else if (normalizedName.includes('aionqa-ai-service')) {
             await startAIServiceContainer();
             console.log(`▶️ Started AI service`);
