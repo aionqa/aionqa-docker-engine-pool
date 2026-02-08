@@ -1067,11 +1067,11 @@ async function startOllamaContainer() {
       c.Names && c.Names.some(n => n.replace(/^\//, '') === OLLAMA_CONTAINER_NAME)
     );
     if (existing) {
-      if (existing.State === 'running') {
-        console.log(`✅ Ollama container already running (model: ${model})`);
-        return;
-      }
       const oldContainer = docker.getContainer(existing.Id);
+      if (existing.State === 'running') {
+        console.log(`🔄 Recreating Ollama container to apply config...`);
+        await oldContainer.stop({ t: 10 }).catch(() => {});
+      }
       await oldContainer.remove({ force: true }).catch(() => {});
     }
 
@@ -1340,7 +1340,7 @@ async function startAIServiceContainer() {
     if (existing) {
       const oldContainer = docker.getContainer(existing.Id);
       if (existing.State === 'running') {
-        console.log(`🔄 Recreating AI service container to apply config (e.g. provider change)...`);
+        console.log(`🔄 Recreating AI service container to apply config...`);
         await oldContainer.stop({ t: 10 }).catch(() => {});
       }
       await oldContainer.remove({ force: true }).catch(() => {});
