@@ -1371,10 +1371,33 @@ async function runPendingContainerActions() {
     );
     const pending = response.data?.pending || [];
     if (pending.length === 0) return;
-    console.log(`[CONTAINER-ACTIONS] Executing ${pending.length} pending action(s):`, pending.map(p => ({ action: p.action, container: p.container_name })));
-    const executedIds = [];
+    const allIds = pending.map(p => p.id).filter(Boolean);
+    // Ack immediately so backend clears the list (stops re-sending same commands); then execute
+    if (allIds.length > 0) {
+      try {
+        await axios.post(
+          `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/pending-actions/ack`,
+          { ids: allIds },
+          { headers: getAuthHeaders(), timeout: 10000 }
+        );
+        console.log(`[CONTAINER-ACTIONS] Acked ${allIds.length} action(s); list cleared on backend.`);
+      } catch (ackErr) {
+        console.warn(`[CONTAINER-ACTIONS] Ack failed (list may not be cleared): ${ackErr.message}`);
+      }
+    }
+    // Deduplicate: execute each (action, container) once
+    const key = (a, name) => `${a}:${(name || '').replace(/^\//, '').toLowerCase()}`;
+    const byKey = new Map();
+    for (const p of pending) {
+      const k = key(p.action, p.container_name);
+      if (!byKey.has(k)) byKey.set(k, { action: p.action, container_name: p.container_name });
+      byKey.get(k).ids = byKey.get(k).ids || [];
+      byKey.get(k).ids.push(p.id);
+    }
+    const toRun = [...byKey.values()];
+    console.log(`[CONTAINER-ACTIONS] Executing ${toRun.length} unique action(s):`, toRun.map(p => ({ action: p.action, container: p.container_name })));
     let selfUpdateRequested = false;
-    for (const { id: actionId, container_name: name, action } of pending) {
+    for (const { action, container_name: name } of toRun) {
       const normalizedName = (name || '').replace(/^\//, '').toLowerCase();
       try {
         const containers = await docker.listContainers({ all: true });
@@ -1407,10 +1430,9 @@ async function runPendingContainerActions() {
             console.log(`▶️ Started container: ${name}`);
           }
         } else if (action === 'update') {
-          if (normalizedName === HELPER_CONTAINER_NAME || normalizedName.includes('aionqa-helper')) {
-            executedIds.push(actionId);
+          if (normalizedName === HELPER_CONTAINER_NAME || normalizedName.includes('aionqa-helper') || normalizedName.includes('docker-engine')) {
             selfUpdateRequested = true;
-            console.log(`🔄 [SELF-UPDATE] Update requested for helper; will pull image and exit.`);
+            console.log(`🔄 [SELF-UPDATE] Update requested for helper; will update image.`);
           } else if (normalizedName.includes('ollama')) {
             await stopAndRemoveOllamaContainer();
             await startOllamaContainer();
@@ -1428,18 +1450,9 @@ async function runPendingContainerActions() {
             console.log(`🔄 Removed container for update: ${name} (recreate not implemented for generic containers)`);
           }
         }
-        if (!selfUpdateRequested) executedIds.push(actionId);
       } catch (err) {
         console.warn(`⚠️ Failed to run action ${action} on ${name}:`, err.message);
-        executedIds.push(actionId);
       }
-    }
-    if (executedIds.length > 0) {
-      await axios.post(
-        `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/pending-actions/ack`,
-        { ids: executedIds },
-        { headers: getAuthHeaders(), timeout: 5000 }
-      );
     }
     if (selfUpdateRequested) {
       await runHelperSelfUpdate();
