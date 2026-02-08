@@ -322,7 +322,7 @@ async function collectRunnerMetrics() {
           cpu_pct: parsed.cpu_pct != null ? Math.round(parsed.cpu_pct * 10) / 10 : null,
           memory_usage_bytes: parsed.memory_usage,
           memory_limit_bytes: parsed.memory_limit,
-          image: (c.Image || '').substring(0, 50)
+          image: c.Image || ''
         });
       } catch (_) {
         out.containers.push({
@@ -332,7 +332,7 @@ async function collectRunnerMetrics() {
           cpu_pct: null,
           memory_usage_bytes: null,
           memory_limit_bytes: null,
-          image: (c.Image || '').substring(0, 50)
+          image: c.Image || ''
         });
       }
     }
@@ -358,7 +358,9 @@ async function sendHeartbeat() {
       {
         status: 'active',
         running_containers: runningContainers.size,
-        metrics
+        metrics,
+        version: HELPER_VERSION,
+        build_date: HELPER_BUILD_DATE
       },
       { headers: getAuthHeaders(), timeout: 15000 }
     );
@@ -963,6 +965,22 @@ function useOllamaAsLLM() {
   return true;
 }
 
+/** Whether to run the Ollama container (config + useOllamaAsLLM). When false, helper will stop and remove it. */
+function isOllamaEnabled() {
+  if (!useOllamaAsLLM()) return false;
+  if (process.env.OLLAMA_ENABLED !== undefined) {
+    return process.env.OLLAMA_ENABLED === 'true' || process.env.OLLAMA_ENABLED === '1';
+  }
+  return helperConfig?.ollama_enabled !== false;
+}
+
+/** Whether to run the AI service container (config or env AI_SERVICE). When false, helper will stop and remove it. */
+function isAIServiceEnabled() {
+  if (process.env.AI_SERVICE === 'true' || process.env.AI_SERVICE === '1') return true;
+  if (process.env.AI_SERVICE === 'false' || process.env.AI_SERVICE === '0') return false;
+  return helperConfig?.ai_service_enabled !== false;
+}
+
 /**
  * Model to pull and run in Ollama. From API config or env.
  */
@@ -1034,9 +1052,11 @@ function getOllamaEnv() {
  * Start Ollama container with GPU and pull the configured model. Uses same protocol as LM Studio (/v1/chat/completions).
  */
 async function startOllamaContainer() {
+  if (!isOllamaEnabled()) return;
   const networkName = process.env.AI_SERVICE_NETWORK || 'aionqa-network';
   const model = getOllamaModel();
   try {
+    await pullOllamaImage();
     const containers = await docker.listContainers({ all: true });
     const existing = containers.find(c =>
       c.Names && c.Names.some(n => n.replace(/^\//, '') === OLLAMA_CONTAINER_NAME)
@@ -1113,12 +1133,76 @@ async function startOllamaContainer() {
 }
 
 /**
+ * Stop and remove the Ollama container. Used when user turns "Ollama service" off in UI.
+ */
+async function stopAndRemoveOllamaContainer() {
+  try {
+    const containers = await docker.listContainers({ all: true });
+    const existing = containers.find(c =>
+      c.Names && c.Names.some(n => n.replace(/^\//, '') === OLLAMA_CONTAINER_NAME)
+    );
+    if (!existing) return;
+    const container = docker.getContainer(existing.Id);
+    if (existing.State === 'running') {
+      await container.stop({ t: 10 }).catch(() => {});
+    }
+    await container.remove({ force: true }).catch(() => {});
+    console.log(`🛑 Ollama container stopped and removed`);
+  } catch (error) {
+    console.warn(`⚠️ Failed to stop/remove Ollama container: ${error.message}`);
+  }
+}
+
+/**
+ * Stop and remove the AI service container. Used when user turns "AI service" off in UI.
+ */
+async function stopAndRemoveAIServiceContainer() {
+  try {
+    const containers = await docker.listContainers({ all: true });
+    const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === AI_SERVICE_CONTAINER_NAME));
+    if (!existing) return;
+    const container = docker.getContainer(existing.Id);
+    if (existing.State === 'running') {
+      await container.stop({ t: 10 }).catch(() => {});
+    }
+    await container.remove({ force: true }).catch(() => {});
+    console.log(`🛑 AI service container stopped and removed`);
+  } catch (error) {
+    console.warn(`⚠️ Failed to stop/remove AI service container: ${error.message}`);
+  }
+}
+
+/** Interval in ms for re-fetching config and reconciling service containers (stop/start to match UI toggles). */
+const RECONCILE_SERVICES_INTERVAL = 60 * 1000;
+
+/**
+ * Reconcile service containers with config: re-fetch config, then stop/remove or start Ollama and AI service to match.
+ * Called periodically so UI toggles take effect without restarting the helper.
+ */
+async function reconcileServices() {
+  try {
+    await fetchHelperConfig();
+    if (isOllamaEnabled()) {
+      await startOllamaContainer();
+    } else {
+      await stopAndRemoveOllamaContainer();
+    }
+    if (isAIServiceEnabled()) {
+      await startAIServiceContainer();
+    } else {
+      await stopAndRemoveAIServiceContainer();
+    }
+  } catch (error) {
+    console.warn(`⚠️ Reconcile services failed: ${error.message}`);
+  }
+}
+
+/**
  * Resolve AI service image URL: env AI_SERVICE_IMAGE_URL, or from backend.
  * Used for both pull and start. Returns null if not AI_SERVICE mode or URL unavailable.
  */
 async function getAIServiceImageUrl() {
-  const aiServiceEnabled = process.env.AI_SERVICE === 'true' || process.env.AI_SERVICE === '1';
-  if (!aiServiceEnabled) return null;
+  if (!isAIServiceEnabled()) return null;
 
   let imageUrl = process.env.AI_SERVICE_IMAGE_URL;
   if (imageUrl) return imageUrl;
@@ -1210,11 +1294,12 @@ function getLMStudioUrl() {
  * LLM backend: default Ollama (http://ollama:11434, same protocol as LM Studio). Set USE_LM_STUDIO_HOST=true for host LM Studio.
  */
 async function startAIServiceContainer() {
-  const aiServiceEnabled = process.env.AI_SERVICE === 'true' || process.env.AI_SERVICE === '1';
-  if (!aiServiceEnabled) return;
+  if (!isAIServiceEnabled()) return;
 
   const imageUrl = await getAIServiceImageUrl();
   if (!imageUrl) return;
+
+  await pullAIServiceImage();
 
   const networkName = process.env.AI_SERVICE_NETWORK || 'aionqa-network';
   const lmStudioUrl = getLMStudioUrl();
@@ -1293,18 +1378,13 @@ async function main() {
   await ensureAionqaNetwork();
   // Check all images on startup (helper + crawler; AI service image pulled with short-lived token)
   await checkAllImages();
-  // Default: start Ollama (GPU, pull model from config) then AI service points to it. Set use_lm_studio_host in UI or USE_LM_STUDIO_HOST to use host LM Studio.
-  if (useOllamaAsLLM()) {
-    await pullOllamaImage();
-    await startOllamaContainer();
-  } else {
-    console.log(`ℹ️  Using host LM Studio (USE_LM_STUDIO_HOST=true)`);
-  }
-  // Start AI service container (common image; helper pulls it with token and runs it)
-  await startAIServiceContainer();
+  // Apply service state from config (Ollama and AI service: start or stop/remove to match UI toggles)
+  await reconcileServices();
 
   // Send heartbeat every 30 seconds
   setInterval(sendHeartbeat, 30000);
+  // Reconcile services every 60s so UI toggles take effect without restart
+  setInterval(reconcileServices, RECONCILE_SERVICES_INTERVAL);
 
   // Clean up exited crawler containers so they are removed when not running (every 30s)
   setInterval(cleanupContainers, 30 * 1000);
