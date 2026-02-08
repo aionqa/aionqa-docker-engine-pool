@@ -1314,8 +1314,10 @@ function getAIServiceEnv() {
     const url = c.ai_service_lm_studio_url || process.env.AI_SERVICE_LM_STUDIO_URL || 'http://host.docker.internal:1234';
     base.push('AI_MODE=lm-studio', `LM_STUDIO_URL=${url}`);
   } else {
+    // ollama: AI service uses native Ollama API (POST /api/chat)
     const url = c.ai_service_ollama_url || 'http://ollama:11434';
-    base.push('AI_MODE=lm-studio', `LM_STUDIO_URL=${url}`);
+    const model = c.ollama_model || process.env.OLLAMA_MODEL || 'llama3.2';
+    base.push('AI_MODE=ollama', `OLLAMA_URL=${url}`, `OLLAMA_MODEL=${model}`);
   }
   return base;
 }
