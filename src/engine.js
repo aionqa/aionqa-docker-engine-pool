@@ -949,6 +949,8 @@ function useOllamaAsLLM() {
   if (process.env.USE_LM_STUDIO_HOST !== undefined) {
     return process.env.USE_LM_STUDIO_HOST !== 'true' && process.env.USE_LM_STUDIO_HOST !== '1';
   }
+  const provider = helperConfig?.ai_service_provider || 'ollama';
+  if (provider === 'lm_studio' || provider === 'openai') return false;
   if (helperConfig && helperConfig.use_lm_studio_host === true) return false;
   return true;
 }
@@ -1033,12 +1035,13 @@ async function pullOllamaImage() {
 function getOllamaEnv() {
   const c = helperConfig || {};
   const env = [
-    `OLLAMA_NUM_PARALLEL=${process.env.OLLAMA_NUM_PARALLEL ?? c.ollama_num_parallel ?? '1'}`,
+    `OLLAMA_NUM_PARALLEL=${process.env.OLLAMA_NUM_PARALLEL ?? c.ollama_num_parallel ?? '4'}`,
     `OLLAMA_MAX_LOADED_MODELS=${process.env.OLLAMA_MAX_LOADED_MODELS ?? c.ollama_max_loaded_models ?? '1'}`,
     `OLLAMA_KEEP_ALIVE=${process.env.OLLAMA_KEEP_ALIVE ?? c.ollama_keep_alive ?? '24h'}`,
     `OLLAMA_MAX_QUEUE=${process.env.OLLAMA_MAX_QUEUE ?? c.ollama_max_queue ?? '512'}`,
-    `OLLAMA_CONTEXT_LENGTH=${process.env.OLLAMA_CONTEXT_LENGTH ?? c.ollama_context_length ?? '128000'}`,
-    `OLLAMA_NUM_THREADS=${process.env.OLLAMA_NUM_THREADS ?? c.ollama_num_threads ?? '12'}`
+    `OLLAMA_NUM_BATCH=${process.env.OLLAMA_NUM_BATCH ?? (c.ollama_num_batch != null && c.ollama_num_batch !== '' ? c.ollama_num_batch : '512')}`,
+    `OLLAMA_CONTEXT_LENGTH=${process.env.OLLAMA_CONTEXT_LENGTH ?? c.ollama_context_length ?? '4096'}`,
+    `OLLAMA_NUM_THREADS=${process.env.OLLAMA_NUM_THREADS ?? c.ollama_num_threads ?? '9'}`
   ];
   const maxVram = process.env.OLLAMA_MAX_VRAM || c.ollama_max_vram;
   if (maxVram) env.push(`OLLAMA_MAX_VRAM=${String(maxVram).trim()}`);
@@ -1304,7 +1307,8 @@ function getAIServiceEnv() {
     if (c.openai_base_url) base.push(`LLM_BASE_URL=${c.openai_base_url}`);
   } else if (provider === 'lm_studio') {
     const url = c.ai_service_lm_studio_url || process.env.AI_SERVICE_LM_STUDIO_URL || 'http://host.docker.internal:1234';
-    base.push('AI_MODE=lm-studio', `LM_STUDIO_URL=${url}`);
+    const model = c.ai_service_lm_studio_model || process.env.LM_STUDIO_MODEL || 'qwen2.5-vl-3b-instruct-img2code';
+    base.push('AI_MODE=lm-studio', `LM_STUDIO_URL=${url}`, `LM_STUDIO_MODEL=${model}`);
   } else {
     // ollama: AI service uses native Ollama API (POST /api/chat)
     const url = c.ai_service_ollama_url || 'http://ollama:11434';
