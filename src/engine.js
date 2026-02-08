@@ -1325,6 +1325,9 @@ function getAIServiceEnv() {
 async function startAIServiceContainer() {
   if (!isAIServiceEnabled()) return;
 
+  // Always fetch latest config so provider/URL changes from UI take effect when we recreate the container
+  await fetchHelperConfig();
+
   const imageUrl = await getAIServiceImageUrl();
   if (!imageUrl) return;
 
