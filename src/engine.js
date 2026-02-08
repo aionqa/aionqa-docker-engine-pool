@@ -1294,9 +1294,33 @@ function getLMStudioUrl() {
 }
 
 /**
+ * Build env vars for the AI service container from helper config (ai_service_provider: openai | lm_studio | ollama).
+ */
+function getAIServiceEnv() {
+  const c = helperConfig || {};
+  const provider = c.ai_service_provider || 'ollama';
+  const base = [
+    `BACKEND_URL=${process.env.BACKEND_URL || 'https://api.aionqa.com'}`,
+    'NODE_ENV=production'
+  ];
+  if (provider === 'openai') {
+    base.push('AI_MODE=openai');
+    if (c.openai_api_key) base.push(`OPENAI_API_KEY=${c.openai_api_key}`);
+    if (c.openai_base_url) base.push(`LLM_BASE_URL=${c.openai_base_url}`);
+  } else if (provider === 'lm_studio') {
+    const url = c.ai_service_lm_studio_url || process.env.AI_SERVICE_LM_STUDIO_URL || 'http://host.docker.internal:1234';
+    base.push('AI_MODE=lm-studio', `LM_STUDIO_URL=${url}`);
+  } else {
+    const url = c.ai_service_ollama_url || 'http://ollama:11434';
+    base.push('AI_MODE=lm-studio', `LM_STUDIO_URL=${url}`);
+  }
+  return base;
+}
+
+/**
  * Start the AI service container (common image pulled by helper with short-lived token).
  * Connects container to AI_SERVICE_NETWORK so helper can reach it at AI_SERVICE_URL.
- * LLM backend: default Ollama (http://ollama:11434, same protocol as LM Studio). Set USE_LM_STUDIO_HOST=true for host LM Studio.
+ * LLM backend comes from helper config: ai_service_provider (openai | lm_studio | ollama).
  */
 async function startAIServiceContainer() {
   if (!isAIServiceEnabled()) return;
@@ -1307,7 +1331,6 @@ async function startAIServiceContainer() {
   await pullAIServiceImage();
 
   const networkName = getConfigNetwork();
-  const lmStudioUrl = getLMStudioUrl();
   try {
     const containers = await docker.listContainers({ all: true });
     const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === AI_SERVICE_CONTAINER_NAME));
@@ -1320,12 +1343,7 @@ async function startAIServiceContainer() {
       await oldContainer.remove({ force: true }).catch(() => {});
     }
 
-    const env = [
-      `BACKEND_URL=${process.env.BACKEND_URL || 'https://api.aionqa.com'}`,
-      'AI_MODE=lm-studio',
-      `LM_STUDIO_URL=${lmStudioUrl}`,
-      'NODE_ENV=production'
-    ];
+    const env = getAIServiceEnv();
 
     const container = await docker.createContainer({
       Image: imageUrl,
