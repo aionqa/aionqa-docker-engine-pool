@@ -916,9 +916,14 @@ async function checkCrawlerImage() {
   }
 }
 
+/** Last time we ran checkAllImages (ms); used to throttle per-job image checks */
+let lastCheckAllImagesTime = 0;
+/** Minimum interval between image checks when triggered by a job (15 min) */
+const IMAGE_CHECK_THROTTLE_MS = 15 * 60 * 1000;
+
 /**
  * Check and update all images (helper, AI service, crawler)
- * Called on startup, when job is received, and periodically
+ * Called on startup, when job is received (throttled), and every 12h
  */
 async function checkAllImages() {
   console.log(`🔄 Checking all images for updates...`);
@@ -928,6 +933,7 @@ async function checkAllImages() {
     checkCrawlerImage()
   ]);
   console.log(`✅ Image check complete`);
+  lastCheckAllImagesTime = Date.now();
 }
 
 /** Default container name for the AI service (helper starts it with short-lived ECR token) */
@@ -1586,10 +1592,13 @@ async function main() {
         console.log(`   Image: ${job.image_url || 'unknown'}`);
         console.log(`   Full job object keys:`, Object.keys(job).join(', '));
         
-        // Check all images for updates when job is received (non-blocking)
-        checkAllImages().catch(err => {
-          console.warn(`⚠️ Image check failed (non-blocking): ${err.message}`);
-        });
+        // Check all images when job is received, but throttle to at most once per 15 min to avoid log spam when jobs are frequent
+        const now = Date.now();
+        if (now - lastCheckAllImagesTime >= IMAGE_CHECK_THROTTLE_MS) {
+          checkAllImages().catch(err => {
+            console.warn(`⚠️ Image check failed (non-blocking): ${err.message}`);
+          });
+        }
         
         // Start container - handle errors but don't block polling
         startCrawlerContainer(job)
