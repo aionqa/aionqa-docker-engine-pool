@@ -169,17 +169,198 @@ async function registerEngine() {
 }
 
 /**
- * Send heartbeat to backend
+ * Check if a container is AionQA-related (crawler, AI service, Ollama, or helper)
+ */
+function isAionqaRelatedContainer(containerInfo) {
+  const names = (containerInfo.Names || []).join(' ');
+  const labels = containerInfo.Labels || {};
+  if (labels['aionqa.engine_id'] || labels['aionqa.job_id']) return true;
+  if (/aionqa|ollama|unified-crawler|aionqa-ai-service|aionqa-docker-engine/.test(names)) return true;
+  return false;
+}
+
+/**
+ * Get one frame of container stats (CPU %, memory usage/limit). Returns null on error.
+ * Docker API with stream: false returns a single JSON object (may be delivered as stream).
+ */
+function getContainerStatsOnce(container) {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      if (s) s.destroy();
+      resolve(null);
+    }, 5000);
+    let s;
+    container.stats({ stream: false }, (err, streamOrData) => {
+      if (err) {
+        clearTimeout(timeout);
+        return resolve(null);
+      }
+      if (!streamOrData) {
+        clearTimeout(timeout);
+        return resolve(null);
+      }
+      // Some drivers return the parsed object directly when stream: false
+      if (typeof streamOrData === 'object' && streamOrData !== null && typeof streamOrData.on !== 'function') {
+        clearTimeout(timeout);
+        return resolve(streamOrData);
+      }
+      s = streamOrData;
+      const chunks = [];
+      streamOrData.on('data', chunk => chunks.push(chunk));
+      streamOrData.on('end', () => {
+        clearTimeout(timeout);
+        try {
+          const data = JSON.parse(Buffer.concat(chunks).toString());
+          resolve(data);
+        } catch (_) {
+          resolve(null);
+        }
+      });
+      streamOrData.on('error', () => {
+        clearTimeout(timeout);
+        resolve(null);
+      });
+    });
+  });
+}
+
+/**
+ * Parse Docker stats blob into cpu_pct and memory_usage/limit
+ */
+function parseStatsBlob(stats) {
+  if (!stats || !stats.memory_stats) return { cpu_pct: null, memory_usage: null, memory_limit: null };
+  const memUsage = stats.memory_stats.usage != null ? Number(stats.memory_stats.usage) : null;
+  const memLimit = stats.memory_stats.limit != null ? Number(stats.memory_stats.limit) : null;
+  let cpu_pct = null;
+  if (stats.cpu_stats && stats.precpu_stats && stats.cpu_stats.cpu_usage && stats.precpu_stats.cpu_usage) {
+    const cpuDelta = stats.cpu_stats.cpu_usage.total_usage - stats.precpu_stats.cpu_usage.total_usage;
+    const systemDelta = stats.cpu_stats.system_cpu_usage - stats.precpu_stats.system_cpu_usage;
+    const numCpus = (stats.cpu_stats.cpu_usage.percpu_usage || []).length || 1;
+    if (systemDelta > 0) {
+      cpu_pct = (cpuDelta / systemDelta) * numCpus * 100;
+    }
+  }
+  return { cpu_pct, memory_usage: memUsage, memory_limit: memLimit };
+}
+
+/**
+ * Try to get GPU info by running nvidia-smi in a container that has GPU (e.g. ollama)
+ */
+async function getGpuMetrics() {
+  try {
+    const containers = await docker.listContainers({ all: false });
+    const ollama = containers.find(c => (c.Names || []).some(n => n.includes('ollama')));
+    if (!ollama) return null;
+    const container = docker.getContainer(ollama.Id);
+    const exec = await container.exec({
+      Cmd: ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total', '--format=csv,noheader,nounits'],
+      AttachStdout: true,
+      AttachStderr: true
+    });
+    const output = await new Promise((resolve, reject) => {
+      exec.start({ Detach: false }, (err, stream) => {
+        if (err) return reject(err);
+        let out = '';
+        stream.on('data', chunk => { out += chunk.toString(); });
+        stream.on('end', () => resolve(out));
+        stream.on('error', reject);
+      });
+    });
+    const line = (output || '').trim().split('\n')[0];
+    if (!line) return null;
+    const [util, memUsed, memTotal] = line.split(',').map(s => parseFloat(s.trim()));
+    if (Number.isNaN(util)) return null;
+    return {
+      utilization_pct: Number.isNaN(util) ? null : util,
+      memory_used_mb: Number.isNaN(memUsed) ? null : memUsed,
+      memory_total_mb: Number.isNaN(memTotal) ? null : memTotal
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Collect runner metrics: host (from Docker info), GPU (if available), and per-container stats for AionQA-related containers.
+ */
+async function collectRunnerMetrics() {
+  const out = {
+    host: null,
+    gpu: null,
+    containers: [],
+    collected_at: new Date().toISOString()
+  };
+  try {
+    const info = await docker.info();
+    out.host = {
+      ncpu: info.NCPU || null,
+      memory_total_bytes: info.MemTotal != null ? info.MemTotal : null,
+      memory_used_bytes: info.MemoryLimit && info.MemoryLimit === false ? null : (info.MemTotal != null ? Math.max(0, info.MemTotal - (info.MemAvailable != null ? info.MemAvailable : 0)) : null)
+    };
+  } catch (_) {
+    out.host = { ncpu: null, memory_total_bytes: null, memory_used_bytes: null };
+  }
+
+  try {
+    out.gpu = await getGpuMetrics();
+  } catch (_) {}
+
+  try {
+    const containers = await docker.listContainers({ all: true });
+    const aionqa = containers.filter(isAionqaRelatedContainer);
+    for (const c of aionqa) {
+      const name = (c.Names || [])[0] || c.Id;
+      const displayName = name.replace(/^\//, '');
+      try {
+        const container = docker.getContainer(c.Id);
+        const stats = await getContainerStatsOnce(container);
+        const parsed = stats ? parseStatsBlob(stats) : {};
+        out.containers.push({
+          id: c.Id.substring(0, 12),
+          name: displayName,
+          state: c.State,
+          cpu_pct: parsed.cpu_pct != null ? Math.round(parsed.cpu_pct * 10) / 10 : null,
+          memory_usage_bytes: parsed.memory_usage,
+          memory_limit_bytes: parsed.memory_limit,
+          image: (c.Image || '').substring(0, 50)
+        });
+      } catch (_) {
+        out.containers.push({
+          id: c.Id.substring(0, 12),
+          name: displayName,
+          state: c.State,
+          cpu_pct: null,
+          memory_usage_bytes: null,
+          memory_limit_bytes: null,
+          image: (c.Image || '').substring(0, 50)
+        });
+      }
+    }
+  } catch (_) {
+    out.containers = [];
+  }
+  return out;
+}
+
+/**
+ * Send heartbeat to backend (includes runner metrics when available)
  */
 async function sendHeartbeat() {
   try {
+    let metrics = null;
+    try {
+      metrics = await collectRunnerMetrics();
+    } catch (err) {
+      console.warn(`⚠️ Metrics collection failed:`, err.message);
+    }
     await axios.post(
       `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/heartbeat`,
       {
         status: 'active',
-        running_containers: runningContainers.size
+        running_containers: runningContainers.size,
+        metrics
       },
-      { headers: getAuthHeaders() }
+      { headers: getAuthHeaders(), timeout: 15000 }
     );
   } catch (error) {
     console.error(`⚠️ Heartbeat failed:`, error.message);
@@ -203,17 +384,25 @@ async function pollForJobs() {
     console.log(`[POLL] Response status: ${response.status}`);
     console.log(`[POLL] Response data:`, JSON.stringify(response.data).substring(0, 500));
 
+    if (response.data && response.data.restart_requested) {
+      console.log(`🔄 [POLL] Restart requested from UI; exiting so container can restart and pick up new config`);
+      process.exit(0);
+    }
     if (response.data && response.data.job) {
       console.log(`📥 [POLL] Received job from backend: ${response.data.job.job_id}`);
       console.log(`   Job type: ${response.data.job.job_type || 'unknown'}`);
       console.log(`   Image: ${response.data.job.image_url || 'unknown'}`);
       return response.data.job;
-    } else {
-      console.log(`⚠️ [POLL] Unexpected response format. Full response:`, JSON.stringify(response.data));
+    }
+    if (response.data && response.data.job === null) {
+      return null;
+    }
+    if (response.data) {
+      console.log(`⚠️ [POLL] Unexpected response format. Full response:`, JSON.stringify(response.data).substring(0, 300));
     }
   } catch (error) {
     if (error.response?.status === 404) {
-      // No jobs available - log occasionally for debugging
+      // No jobs available (legacy 404)
       console.log(`[POLL] No jobs available (404)`);
       return null;
     } else if (error.response?.status === 401) {
@@ -739,6 +928,189 @@ async function checkAllImages() {
 
 /** Default container name for the AI service (helper starts it with short-lived ECR token) */
 const AI_SERVICE_CONTAINER_NAME = 'aionqa-ai-service';
+/** Ollama container (default LLM when USE_LM_STUDIO_HOST is not set) */
+const OLLAMA_CONTAINER_NAME = 'ollama';
+
+/** Helper config from API (fetched on startup; env overrides) */
+let helperConfig = null;
+
+/**
+ * Fetch helper config from backend. Called on startup so params can be changed in UI and applied after restart.
+ */
+async function fetchHelperConfig() {
+  try {
+    const response = await axios.get(
+      `${BACKEND_URL}/api/docker-engines/config`,
+      { headers: getAuthHeaders(), timeout: 10000 }
+    );
+    if (response.data && response.data.config) {
+      helperConfig = response.data.config;
+      console.log(`✅ Helper config loaded from API (e.g. ollama_model: ${helperConfig.ollama_model})`);
+    }
+  } catch (error) {
+    console.warn(`⚠️ Could not fetch helper config (using env/defaults): ${error.message}`);
+  }
+}
+
+/**
+ * Use Ollama as LLM backend (default). Set use_lm_studio_host (API) or USE_LM_STUDIO_HOST (env) to use host LM Studio.
+ */
+function useOllamaAsLLM() {
+  if (process.env.USE_LM_STUDIO_HOST !== undefined) {
+    return process.env.USE_LM_STUDIO_HOST !== 'true' && process.env.USE_LM_STUDIO_HOST !== '1';
+  }
+  if (helperConfig && helperConfig.use_lm_studio_host === true) return false;
+  return true;
+}
+
+/**
+ * Model to pull and run in Ollama. From API config or env.
+ */
+function getOllamaModel() {
+  if (process.env.OLLAMA_MODEL) return process.env.OLLAMA_MODEL;
+  if (helperConfig && helperConfig.ollama_model) return helperConfig.ollama_model;
+  return 'qwen2.5vl:3b';
+}
+
+/**
+ * Ensure aionqa-network exists (for AI service and Ollama). Create if missing.
+ */
+async function ensureAionqaNetwork() {
+  const networkName = process.env.AI_SERVICE_NETWORK || 'aionqa-network';
+  try {
+    const networks = await docker.listNetworks();
+    const exists = networks.some(n => n.Name === networkName);
+    if (exists) return;
+    await docker.createNetwork({ Name: networkName });
+    console.log(`✅ Created network: ${networkName}`);
+  } catch (error) {
+    console.warn(`⚠️ Failed to ensure network ${networkName}: ${error.message}`);
+  }
+}
+
+/**
+ * Pull Ollama image if not present.
+ */
+async function pullOllamaImage() {
+  const image = 'ollama/ollama:latest';
+  try {
+    const images = await docker.listImages();
+    const hasImage = images.some(img =>
+      img.RepoTags && img.RepoTags.some(tag => tag === image || tag.startsWith('ollama/ollama:'))
+    );
+    if (hasImage) {
+      console.log(`✅ Ollama image found locally`);
+      return;
+    }
+    console.log(`📥 Pulling ${image}...`);
+    await new Promise((resolve, reject) => {
+      docker.pull(image, (err, stream) => {
+        if (err) return reject(err);
+        docker.modem.followProgress(stream, (err) => (err ? reject(err) : resolve()));
+      });
+    });
+    console.log(`✅ Ollama image pulled`);
+  } catch (error) {
+    console.warn(`⚠️ Failed to pull Ollama image: ${error.message}`);
+  }
+}
+
+/**
+ * LM Studio–matching params for Ollama. From API config or env.
+ */
+function getOllamaEnv() {
+  const c = helperConfig || {};
+  return [
+    `OLLAMA_NUM_PARALLEL=${process.env.OLLAMA_NUM_PARALLEL ?? c.ollama_num_parallel ?? '1'}`,
+    `OLLAMA_MAX_LOADED_MODELS=${process.env.OLLAMA_MAX_LOADED_MODELS || '1'}`,
+    `OLLAMA_KEEP_ALIVE=${process.env.OLLAMA_KEEP_ALIVE ?? c.ollama_keep_alive ?? '24h'}`,
+    `OLLAMA_MAX_QUEUE=${process.env.OLLAMA_MAX_QUEUE ?? c.ollama_max_queue ?? '512'}`,
+    `OLLAMA_CONTEXT_LENGTH=${process.env.OLLAMA_CONTEXT_LENGTH ?? c.ollama_context_length ?? '128000'}`,
+    `OLLAMA_NUM_THREADS=${process.env.OLLAMA_NUM_THREADS ?? c.ollama_num_threads ?? '12'}`
+  ];
+}
+
+/**
+ * Start Ollama container with GPU and pull the configured model. Uses same protocol as LM Studio (/v1/chat/completions).
+ */
+async function startOllamaContainer() {
+  const networkName = process.env.AI_SERVICE_NETWORK || 'aionqa-network';
+  const model = getOllamaModel();
+  try {
+    const containers = await docker.listContainers({ all: true });
+    const existing = containers.find(c =>
+      c.Names && c.Names.some(n => n.replace(/^\//, '') === OLLAMA_CONTAINER_NAME)
+    );
+    if (existing) {
+      if (existing.State === 'running') {
+        console.log(`✅ Ollama container already running (model: ${model})`);
+        return;
+      }
+      const oldContainer = docker.getContainer(existing.Id);
+      await oldContainer.remove({ force: true }).catch(() => {});
+    }
+
+    const hostConfig = {
+      NetworkMode: networkName,
+      RestartPolicy: { Name: 'unless-stopped' },
+      PortBindings: { '11434/tcp': [{ HostPort: '11434' }] },
+      Binds: ['ollama-models:/root/.ollama']
+    };
+    if (process.env.OLLAMA_GPU !== '0' && process.env.OLLAMA_GPU !== 'false') {
+      hostConfig.DeviceRequests = [
+        { Driver: 'nvidia', Count: -1, Capabilities: [['gpu']] }
+      ];
+    }
+
+    const container = await docker.createContainer({
+      Image: 'ollama/ollama:latest',
+      name: OLLAMA_CONTAINER_NAME,
+      Env: getOllamaEnv(),
+      ExposedPorts: { '11434/tcp': {} },
+      HostConfig: hostConfig
+    });
+    await container.start();
+    console.log(`✅ Ollama container started on network ${networkName}`);
+
+    // Wait for Ollama server to be ready then pull the model
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    try {
+      const exec = await container.exec({
+        Cmd: ['ollama', 'pull', model],
+        AttachStdout: true,
+        AttachStderr: true
+      });
+      await new Promise((resolve, reject) => {
+        exec.start({ Detach: false }, (err, stream) => {
+          if (err) return reject(err);
+          container.modem.demuxStream(stream, process.stdout, process.stderr);
+          stream.on('finish', resolve);
+          stream.on('error', reject);
+        });
+      });
+      let exitCode = null;
+      for (let i = 0; i < 120; i++) {
+        await new Promise(r => setTimeout(r, 500));
+        const info = await exec.inspect();
+        if (info.Running === false) {
+          exitCode = info.ExitCode;
+          break;
+        }
+      }
+      if (exitCode === 0) {
+        console.log(`✅ Ollama model pulled: ${model}`);
+      } else if (exitCode != null) {
+        console.warn(`⚠️ ollama pull ${model} exited with code ${exitCode}`);
+      } else {
+        console.warn(`⚠️ ollama pull ${model} still running (timeout)`);
+      }
+    } catch (pullErr) {
+      console.warn(`⚠️ Failed to pull Ollama model ${model}: ${pullErr.message}`);
+    }
+  } catch (error) {
+    console.warn(`⚠️ Failed to start Ollama container: ${error.message}`);
+  }
+}
 
 /**
  * Resolve AI service image URL: env AI_SERVICE_IMAGE_URL, or from backend.
@@ -817,8 +1189,25 @@ async function pullAIServiceImage() {
 }
 
 /**
+ * Resolve LLM URL: when using Ollama (default) use http://ollama:11434; else API config or env (host LM Studio).
+ */
+function getLMStudioUrl() {
+  if (useOllamaAsLLM()) {
+    return 'http://ollama:11434';
+  }
+  if (process.env.AI_SERVICE_LM_STUDIO_URL || process.env.LM_STUDIO_URL) {
+    return process.env.AI_SERVICE_LM_STUDIO_URL || process.env.LM_STUDIO_URL;
+  }
+  if (helperConfig && helperConfig.ai_service_lm_studio_url) {
+    return helperConfig.ai_service_lm_studio_url;
+  }
+  return 'http://host.docker.internal:1234';
+}
+
+/**
  * Start the AI service container (common image pulled by helper with short-lived token).
  * Connects container to AI_SERVICE_NETWORK so helper can reach it at AI_SERVICE_URL.
+ * LLM backend: default Ollama (http://ollama:11434, same protocol as LM Studio). Set USE_LM_STUDIO_HOST=true for host LM Studio.
  */
 async function startAIServiceContainer() {
   const aiServiceEnabled = process.env.AI_SERVICE === 'true' || process.env.AI_SERVICE === '1';
@@ -828,6 +1217,7 @@ async function startAIServiceContainer() {
   if (!imageUrl) return;
 
   const networkName = process.env.AI_SERVICE_NETWORK || 'aionqa-network';
+  const lmStudioUrl = getLMStudioUrl();
   try {
     const containers = await docker.listContainers({ all: true });
     const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === AI_SERVICE_CONTAINER_NAME));
@@ -843,7 +1233,7 @@ async function startAIServiceContainer() {
     const env = [
       `BACKEND_URL=${process.env.BACKEND_URL || 'https://api.aionqa.com'}`,
       'AI_MODE=lm-studio',
-      `LM_STUDIO_URL=${process.env.AI_SERVICE_LM_STUDIO_URL || process.env.LM_STUDIO_URL || 'http://host.docker.internal:1234'}`,
+      `LM_STUDIO_URL=${lmStudioUrl}`,
       'NODE_ENV=production'
     ];
 
@@ -897,8 +1287,19 @@ async function main() {
     console.warn(`⚠️  Engine registration failed - continuing with polling (engine may be pre-registered)`);
   }
 
+  // Fetch helper config from API (UI-editable; env overrides)
+  await fetchHelperConfig();
+  // Ensure network exists (for AI service and optional Ollama)
+  await ensureAionqaNetwork();
   // Check all images on startup (helper + crawler; AI service image pulled with short-lived token)
   await checkAllImages();
+  // Default: start Ollama (GPU, pull model from config) then AI service points to it. Set use_lm_studio_host in UI or USE_LM_STUDIO_HOST to use host LM Studio.
+  if (useOllamaAsLLM()) {
+    await pullOllamaImage();
+    await startOllamaContainer();
+  } else {
+    console.log(`ℹ️  Using host LM Studio (USE_LM_STUDIO_HOST=true)`);
+  }
   // Start AI service container (common image; helper pulls it with token and runs it)
   await startAIServiceContainer();
 
