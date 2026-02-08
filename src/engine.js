@@ -17,11 +17,6 @@ const SERVICE_KEY = process.env.SERVICE_KEY; // Optional service key for image U
 const ENGINE_ID = process.env.ENGINE_ID || `docker-engine-${hostname()}-${randomUUID().substring(0, 8)}`;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '5000'); // 5 seconds
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
-const IMAGE_UPDATE_INTERVAL = 12 * 60 * 60 * 1000; // 12 hours in milliseconds
-/** Process start time (ms) - used to skip helper self-update right after restart to avoid loop */
-const processStartTime = Date.now();
-const MIN_UPTIME_BEFORE_SELF_UPDATE_MS = 2 * 60 * 1000; // 2 minutes
-
 // ECR repositories are public - no AWS credentials needed
 // Helper uses ENGINE_TOKEN (project credentials) for backend authentication only
 
@@ -392,17 +387,12 @@ async function pollForJobs() {
     console.log(`[POLL] Response data:`, JSON.stringify(response.data).substring(0, 500));
 
     if (response.data && response.data.restart_requested) {
-      const uptimeMs = Date.now() - processStartTime;
-      if (uptimeMs < MIN_UPTIME_BEFORE_SELF_UPDATE_MS) {
-        console.log(`🔄 [POLL] Ignoring restart_requested (uptime ${Math.round(uptimeMs / 1000)}s < 2 min, avoid restart loop)`);
+      console.log(`🔄 [POLL] Restart requested; updating helper image on disk (will not exit to avoid restart loop).`);
+      const result = await updateHelperImage();
+      if (result.safeToRestart) {
+        console.log(`✅ [POLL] Helper image updated. Restart the container manually (e.g. docker compose up -d --force-recreate) to use it.`);
       } else {
-        console.log(`🔄 [POLL] Restart requested; updating helper image then exiting if update path is clear.`);
-        const result = await updateHelperImage();
-        if (result.safeToRestart) {
-          console.log(`🔄 [POLL] Exiting so container can restart with updated image.`);
-          process.exit(0);
-        }
-        console.warn(`⚠️ [POLL] Not exiting: restart requested but update unclear (${result.reason}); avoid indefinite restart.`);
+        console.warn(`⚠️ [POLL] Could not update: ${result.reason}. Restart container manually if needed.`);
       }
     }
     if (response.data && response.data.job) {
@@ -910,15 +900,8 @@ async function checkCrawlerImage() {
   }
 }
 
-/** Last time we ran checkAllImages (ms); used to throttle per-job image checks */
-let lastCheckAllImagesTime = 0;
-/** Minimum interval between image checks when triggered by a job (15 min) */
-const IMAGE_CHECK_THROTTLE_MS = 15 * 60 * 1000;
-
 /**
- * Check and update all images (helper, AI service, crawler).
- * Called on startup (skipHelper=true), when job is received (throttled), and every 12h.
- * @param {boolean} skipHelper - If true, skip helper image check (avoid re-pulling the image we're already running on startup).
+ * Check and update all images (helper, AI service, crawler). Only used when explicitly updating (e.g. not on a timer).
  */
 async function checkAllImages(skipHelper = false) {
   console.log(`🔄 Checking all images for updates...`);
@@ -929,7 +912,6 @@ async function checkAllImages(skipHelper = false) {
   ];
   await Promise.allSettled(tasks);
   console.log(`✅ Image check complete`);
-  lastCheckAllImagesTime = Date.now();
 }
 
 /** Default container name for the AI service (helper starts it with short-lived ECR token) */
@@ -1058,27 +1040,26 @@ function getOllamaEnv() {
 }
 
 /**
- * Start Ollama container with GPU and pull the configured model. Uses same protocol as LM Studio (/v1/chat/completions).
+ * Start Ollama container with GPU and pull the configured model.
+ * If container already exists and is running, skip (no recreate) to avoid repeated pulls every reconcile.
  */
 async function startOllamaContainer() {
   if (!isOllamaEnabled()) return;
   const networkName = getConfigNetwork();
   const model = getOllamaModel();
   try {
-    await pullOllamaImage();
     const containers = await docker.listContainers({ all: true });
     const existing = containers.find(c =>
       c.Names && c.Names.some(n => n.replace(/^\//, '') === OLLAMA_CONTAINER_NAME)
     );
+    if (existing && existing.State === 'running') {
+      return; // Already running; do not recreate every 60s (avoids repeated image/model pulls)
+    }
     if (existing) {
       const oldContainer = docker.getContainer(existing.Id);
-      if (existing.State === 'running') {
-        console.log(`🔄 Recreating Ollama container to apply config...`);
-        await oldContainer.stop({ t: 10 }).catch(() => {});
-      }
       await oldContainer.remove({ force: true }).catch(() => {});
     }
-
+    await pullOllamaImage();
     const hostConfig = {
       NetworkMode: networkName,
       RestartPolicy: { Name: 'unless-stopped' },
@@ -1181,12 +1162,9 @@ async function stopAndRemoveAIServiceContainer() {
   }
 }
 
-/** Interval in ms for re-fetching config and reconciling service containers (stop/start to match UI toggles). */
-const RECONCILE_SERVICES_INTERVAL = 60 * 1000;
-
 /**
- * Reconcile service containers with config: re-fetch config, then stop/remove or start Ollama and AI service to match.
- * Called periodically so UI toggles take effect without restarting the helper.
+ * Reconcile service containers with config: start or stop Ollama and AI service to match UI.
+ * Called once on startup and when UI sends pending actions (start/stop/update). No timer - Docker handles restarts.
  */
 async function reconcileServices() {
   try {
@@ -1332,27 +1310,23 @@ function getAIServiceEnv() {
 async function startAIServiceContainer() {
   if (!isAIServiceEnabled()) return;
 
-  // Always fetch latest config so provider/URL changes from UI take effect when we recreate the container
   await fetchHelperConfig();
-
   const imageUrl = await getAIServiceImageUrl();
   if (!imageUrl) return;
-
-  await pullAIServiceImage();
 
   const networkName = getConfigNetwork();
   try {
     const containers = await docker.listContainers({ all: true });
     const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === AI_SERVICE_CONTAINER_NAME));
+    if (existing && existing.State === 'running') {
+      return; // Already running; do not recreate every 60s (avoids repeated image pulls)
+    }
     if (existing) {
       const oldContainer = docker.getContainer(existing.Id);
-      if (existing.State === 'running') {
-        console.log(`🔄 Recreating AI service container to apply config...`);
-        await oldContainer.stop({ t: 10 }).catch(() => {});
-      }
+      await oldContainer.stop({ t: 10 }).catch(() => {});
       await oldContainer.remove({ force: true }).catch(() => {});
     }
-
+    await pullAIServiceImage();
     const env = getAIServiceEnv();
 
     const container = await docker.createContainer({
@@ -1380,10 +1354,10 @@ async function runHelperSelfUpdate() {
   console.log(`🔄 [SELF-UPDATE] Updating helper image; will exit only if update path is clear.`);
   const result = await updateHelperImage();
   if (result.safeToRestart) {
-    console.log(`✅ [SELF-UPDATE] Helper image updated; exiting so host can restart.`);
-    process.exit(0);
+    console.log(`✅ [SELF-UPDATE] Helper image updated. Restart the container manually (e.g. docker compose up -d --force-recreate) to use it.`);
+  } else {
+    console.warn(`⚠️ [SELF-UPDATE] Could not update: ${result.reason}. Restart container manually if needed.`);
   }
-  console.warn(`⚠️ [SELF-UPDATE] Not exiting: update unclear (${result.reason}); avoid indefinite restart.`);
 }
 
 /**
@@ -1468,12 +1442,7 @@ async function runPendingContainerActions() {
       );
     }
     if (selfUpdateRequested) {
-      const uptimeMs = Date.now() - processStartTime;
-      if (uptimeMs < MIN_UPTIME_BEFORE_SELF_UPDATE_MS) {
-        console.log(`🔄 [SELF-UPDATE] Skipping helper update (uptime ${Math.round(uptimeMs / 1000)}s < 2 min, avoid restart loop)`);
-      } else {
-        await runHelperSelfUpdate();
-      }
+      await runHelperSelfUpdate();
     }
   } catch (err) {
     if (err.response?.status === 404) {
@@ -1516,13 +1485,9 @@ async function main() {
     console.warn(`⚠️  Engine registration failed - continuing with polling (engine may be pre-registered)`);
   }
 
-  // Fetch helper config from API (UI-editable; env overrides)
   await fetchHelperConfig().catch(err => console.warn('⚠️ Initial config fetch failed (will retry in reconcile):', err.message));
-  // Ensure network exists (for AI service and optional Ollama)
   await ensureAionqaNetwork().catch(err => console.warn('⚠️ Ensure network failed:', err.message));
-  // Check images on startup; skip helper image so we don't re-pull the 3.2 GB image we're already running (12h interval will check helper later)
-  await checkAllImages(true);
-  // Apply service state from config (Ollama and AI service: start or stop/remove to match UI toggles). Always run so services start even if earlier steps had issues.
+  // Start Ollama and AI service once from config; no periodic reconcile - Docker handles restarts, UI actions handle updates
   await reconcileServices();
 
   // Retry reconcile once after delay so Ollama/AI service start even if first run had transient failures (config not ready, image pull slow, etc.)
@@ -1534,15 +1499,12 @@ async function main() {
 
   // Send heartbeat every 30 seconds
   setInterval(sendHeartbeat, 30000);
-  // Reconcile services every 60s so UI toggles take effect without restart
-  setInterval(reconcileServices, RECONCILE_SERVICES_INTERVAL);
+  // No periodic reconcile: Docker handles restarts. Start/stop/update only when UI sends pending actions.
 
-  // Clean up exited crawler containers so they are removed when not running (every 30s)
   setInterval(cleanupContainers, 30 * 1000);
-  await cleanupContainers(); // run once on startup
-  
-  // Check all images for updates every 12 hours
-  setInterval(checkAllImages, IMAGE_UPDATE_INTERVAL);
+  await cleanupContainers();
+
+  // No periodic image check: update images only when explicitly told (restart_requested, pending "update" actions) or when starting a container that needs one.
 
   // Main polling loop
   let pollCount = 0;
@@ -1570,15 +1532,7 @@ async function main() {
         console.log(`   Image: ${job.image_url || 'unknown'}`);
         console.log(`   Full job object keys:`, Object.keys(job).join(', '));
         
-        // Check all images when job is received, but throttle to at most once per 15 min to avoid log spam when jobs are frequent
-        const now = Date.now();
-        if (now - lastCheckAllImagesTime >= IMAGE_CHECK_THROTTLE_MS) {
-          checkAllImages().catch(err => {
-            console.warn(`⚠️ Image check failed (non-blocking): ${err.message}`);
-          });
-        }
-        
-        // Start container - handle errors but don't block polling
+        // Start container (pulls job image if needed); no periodic image check - update only when UI explicitly requests
         startCrawlerContainer(job)
           .then(() => {
             console.log(`✅ [MAIN LOOP] Successfully started container for job ${job.job_id}`);
