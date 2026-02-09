@@ -7,7 +7,7 @@ import Docker from 'dockerode';
 import axios from 'axios';
 import { hostname, cpus } from 'os';
 import { randomUUID } from 'crypto';
-// execAsync no longer needed - ECR authentication removed
+import { execSync } from 'child_process';
 
 // Default to 'back' service name for docker-compose networks
 // In Docker Compose, services are resolved by service name, not container name
@@ -389,10 +389,14 @@ async function pollForJobs() {
     console.log(`[POLL] Response data:`, JSON.stringify(response.data).substring(0, 500));
 
     if (response.data && response.data.restart_requested) {
-      console.log(`🔄 [POLL] Restart requested; updating helper image on disk (will not exit to avoid restart loop).`);
+      console.log(`🔄 [POLL] Restart requested; updating helper image then recreating container.`);
       const result = await updateHelperImage();
       if (result.safeToRestart) {
-        console.log(`✅ [POLL] Helper image updated. Restart the container manually (e.g. docker compose up -d --force-recreate) to use it.`);
+        console.log(`✅ [POLL] Helper image updated.`);
+        const recreated = runComposeRecreate();
+        if (!recreated) {
+          console.log(`ℹ️ [POLL] Set COMPOSE_PROJECT_DIR to recreate automatically. Otherwise run: docker compose up -d --force-recreate`);
+        }
       } else {
         console.warn(`⚠️ [POLL] Could not update: ${result.reason}. Restart container manually if needed.`);
       }
@@ -1371,15 +1375,40 @@ async function startAIServiceContainer() {
 }
 
 /**
+ * Run docker compose up -d --force-recreate when COMPOSE_PROJECT_DIR is set.
+ * Returns true if recreate was run (and may have succeeded; process may exit when container is recreated).
+ */
+function runComposeRecreate() {
+  const composeDir = process.env.COMPOSE_PROJECT_DIR || process.env.COMPOSE_PROJECT_DIRECTORY;
+  if (!composeDir) return false;
+  const composeFile = process.env.COMPOSE_FILE;
+  try {
+    const cmd = composeFile
+      ? `docker compose -f "${composeFile}" up -d --force-recreate`
+      : 'docker compose up -d --force-recreate';
+    console.log(`🔄 [SELF-UPDATE] Running recreate: ${cmd} (cwd: ${composeDir})`);
+    execSync(cmd, { cwd: composeDir, stdio: 'inherit', timeout: 120000 });
+    console.log(`✅ [SELF-UPDATE] Recreate completed. Container should be running new image.`);
+    return true;
+  } catch (err) {
+    console.warn(`⚠️ [SELF-UPDATE] Recreate failed: ${err.message}. Recreate the container manually (e.g. docker compose up -d --force-recreate).`);
+    return false;
+  }
+}
+
+/**
  * Update helper image (backend URL + image_sha, pull only if needed).
- * The new image is downloaded and stored on disk; the currently running process is still the old image.
- * To run the new image you must recreate the container (e.g. docker compose up -d --force-recreate).
+ * If download succeeds and COMPOSE_PROJECT_DIR is set, runs docker compose up -d --force-recreate immediately.
  */
 async function runHelperSelfUpdate() {
   console.log(`🔄 [SELF-UPDATE] Updating helper image (pull only; recreate container to run new image).`);
   const result = await updateHelperImage();
   if (result.safeToRestart) {
-    console.log(`✅ [SELF-UPDATE] New image downloaded. Recreate the container to use it (e.g. docker compose up -d --force-recreate).`);
+    console.log(`✅ [SELF-UPDATE] New image downloaded.`);
+    const recreated = runComposeRecreate();
+    if (!recreated) {
+      console.log(`ℹ️ [SELF-UPDATE] Set COMPOSE_PROJECT_DIR to recreate automatically. Otherwise run: docker compose up -d --force-recreate`);
+    }
   } else {
     console.warn(`⚠️ [SELF-UPDATE] Could not update: ${result.reason}. Restart container manually if needed.`);
   }
