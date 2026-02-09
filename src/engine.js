@@ -558,9 +558,7 @@ async function startCrawlerContainer(job) {
     }
 
     // Create container
-    // Build environment variables - match localDockerTaskService.js configuration
-    // AI_SERVICE_URL is configurable via helper environment or defaults to docker-compose service name
-    const aiServiceUrl = process.env.AI_SERVICE_URL || 'http://aionqa-ai-service:5000';
+    // Build environment variables. No AI_SERVICE_URL default - crawler gets ai_services from job context (GET /api/jobs/:id).
     const containerEnv = [
       `JOB_ID=${job_id}`,
       `JOB_TYPE=${job_type || (job.job_type || (job.type === 'login' ? 'login' : 'crawl'))}`, // CRITICAL: Pass job type explicitly
@@ -569,7 +567,6 @@ async function startCrawlerContainer(job) {
       `RUNNER_TOKEN=${runner_token}`, // Service-managed token from backend
       `RUNNER_TYPE=service-managed`, // Mark as service-managed crawler
       `RUNNER_ID=container-${job_id}`,
-      `AI_SERVICE_URL=${aiServiceUrl}`, // AI service URL (no OpenAI key needed in crawler)
       // CRITICAL: AI_SERVICE_TOKEN must NOT be passed to crawlers for security
       // Crawlers authenticate to AI service via RUNNER_TOKEN or other method
       `POLL_INTERVAL=3000`,
@@ -1200,7 +1197,7 @@ async function reconcileServices() {
       await stopAndRemoveOllamaContainer();
     }
     if (isAIServiceEnabled()) {
-      await startAIServiceContainer();
+      await startAIServiceContainer(true); // config already fetched above
     } else {
       await stopAndRemoveAIServiceContainer();
     }
@@ -1332,11 +1329,12 @@ function getAIServiceEnv() {
  * Start the AI service container (common image pulled by helper with short-lived token).
  * Connects container to AI_SERVICE_NETWORK so helper can reach it at AI_SERVICE_URL.
  * LLM backend comes from helper config: ai_service_provider (openai | lm_studio | ollama).
+ * @param {boolean} useCachedConfig - If true, skip fetching config (caller already did, e.g. reconcileServices).
  */
-async function startAIServiceContainer() {
+async function startAIServiceContainer(useCachedConfig = false) {
+  if (!useCachedConfig) await fetchHelperConfig();
   if (!isAIServiceEnabled()) return;
 
-  await fetchHelperConfig();
   const imageUrl = await getAIServiceImageUrl();
   if (!imageUrl) return;
 
@@ -1598,7 +1596,7 @@ async function runPendingContainerActions() {
             await fetchHelperConfig();
             await stopAndRemoveAIServiceContainer();
             await pullAIServiceImage(true);
-            await startAIServiceContainer();
+            await startAIServiceContainer(true);
             console.log(`🔄 Updated AI service`);
           } else if (found) {
             const container = docker.getContainer(found.Id);
@@ -1658,9 +1656,8 @@ async function main() {
     console.warn(`⚠️  Engine registration failed - continuing with polling (engine may be pre-registered)`);
   }
 
-  await fetchHelperConfig().catch(err => console.warn('⚠️ Initial config fetch failed (will retry in reconcile):', err.message));
   await ensureAionqaNetwork().catch(err => console.warn('⚠️ Ensure network failed:', err.message));
-  // Start Ollama and AI service once from config; no periodic reconcile - Docker handles restarts, UI actions handle updates
+  // Load config and start Ollama / AI service once (reconcileServices fetches config; no need to fetch twice)
   await reconcileServices();
 
   // Retry reconcile once after delay so Ollama/AI service start even if first run had transient failures (config not ready, image pull slow, etc.)
