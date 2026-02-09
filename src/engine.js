@@ -7,7 +7,6 @@ import Docker from 'dockerode';
 import axios from 'axios';
 import { hostname, cpus } from 'os';
 import { randomUUID } from 'crypto';
-import { execSync } from 'child_process';
 import { readFileSync } from 'fs';
 
 // Default to 'back' service name for docker-compose networks
@@ -1401,58 +1400,81 @@ function getOwnContainerId() {
 }
 
 /**
- * Get compose project working dir (and optional config file) from this container's labels.
- * Works when the container was started by Docker Compose (labels are set automatically).
- * @returns {Promise<{ workingDir: string, configFiles?: string } | null>}
+ * If this process is the new container after a self-update, take over the original name:
+ * stop and remove the old container, then rename this container to the original name.
+ * Call at startup before registration. No-op if not a replacement.
  */
-async function getComposeProjectFromLabels() {
-  const cid = getOwnContainerId();
-  if (!cid) return null;
+async function runSelfUpdateTakeoverIfNeeded() {
+  const oldId = process.env.OLD_HELPER_CONTAINER_ID;
+  const originalName = process.env.ORIGINAL_HELPER_NAME;
+  if (!oldId || !originalName) return;
+  const myId = getOwnContainerId();
+  if (!myId || myId === oldId) return;
   try {
-    const container = docker.getContainer(cid);
-    const data = await container.inspect();
-    const labels = data.Config?.Labels || {};
-    const workingDir = labels['com.docker.compose.project.working_dir'];
-    const configFiles = labels['com.docker.compose.project.config_files'];
-    if (workingDir) return { workingDir, configFiles: configFiles || undefined };
-  } catch (_) {}
-  return null;
-}
-
-/**
- * Run docker compose up -d --force-recreate.
- * Discovers project dir from container labels (compose) or from env COMPOSE_PROJECT_DIR.
- * Returns true if recreate was run successfully.
- */
-async function runComposeRecreate() {
-  let composeDir = null;
-  let composeFile = null;
-  const fromLabels = await getComposeProjectFromLabels();
-  if (fromLabels) {
-    composeDir = fromLabels.workingDir;
-    if (fromLabels.configFiles) composeFile = fromLabels.configFiles.split(',')[0]?.trim();
-  }
-  if (!composeDir) composeDir = process.env.COMPOSE_PROJECT_DIR || process.env.COMPOSE_PROJECT_DIRECTORY;
-  if (!composeDir) return false;
-  if (!composeFile) composeFile = process.env.COMPOSE_FILE;
-  try {
-    const cmd = composeFile
-      ? `docker compose -f "${composeFile}" up -d --force-recreate`
-      : 'docker compose up -d --force-recreate';
-    console.log(`🔄 [SELF-UPDATE] Running recreate: ${cmd} (cwd: ${composeDir})`);
-    execSync(cmd, { cwd: composeDir, stdio: 'inherit', timeout: 120000 });
-    console.log(`✅ [SELF-UPDATE] Recreate completed. Container should be running new image.`);
-    return true;
+    console.log(`🔄 [SELF-UPDATE] Taking over: stopping and removing old container ${oldId}, then renaming to ${originalName}.`);
+    const oldContainer = docker.getContainer(oldId);
+    try {
+      await oldContainer.stop({ t: 10 });
+    } catch (_) {}
+    await oldContainer.remove({ force: true });
+    const self = docker.getContainer(myId);
+    await self.rename({ name: originalName });
+    console.log(`✅ [SELF-UPDATE] Replaced old container; this container is now ${originalName}.`);
   } catch (err) {
-    console.warn(`⚠️ [SELF-UPDATE] Recreate failed: ${err.message}.`);
-    return false;
+    console.warn(`⚠️ [SELF-UPDATE] Takeover failed: ${err.message}. Continuing with current name.`);
   }
 }
 
 /**
- * Recreate this container using Docker API only (no compose).
- * Creates a new container from newImageUrl with same config as current, starts it, then exits (current container stops).
- * New container will have a different name (current name + "-new"); one container running.
+ * Build createContainer options from current container inspect, with new image.
+ * Clones Config (Cmd, Env, WorkingDir, Labels) and HostConfig so the new container has the same params as compose.
+ */
+function buildCreateOptsFromInspect(data, newImageUrl, newName, extraEnv) {
+  const config = data.Config || {};
+  const hostConfig = data.HostConfig || {};
+  const env = Array.isArray(config.Env) ? [...config.Env] : [];
+  if (extraEnv) {
+    for (const [k, v] of Object.entries(extraEnv)) env.push(`${k}=${v}`);
+  }
+  const createOpts = {
+    Image: newImageUrl,
+    Cmd: config.Cmd,
+    Env: env,
+    WorkingDir: config.WorkingDir || '',
+    name: newName
+  };
+  if (config.Labels && Object.keys(config.Labels).length > 0) {
+    createOpts.Labels = config.Labels;
+  }
+  const hc = {
+    NetworkMode: hostConfig.NetworkMode || 'default',
+    Binds: hostConfig.Binds || [],
+    PortBindings: hostConfig.PortBindings || {},
+    RestartPolicy: hostConfig.RestartPolicy || { Name: 'unless-stopped' },
+    AutoRemove: false
+  };
+  if (hostConfig.Mounts && hostConfig.Mounts.length > 0) hc.Mounts = hostConfig.Mounts;
+  if (hostConfig.ExtraHosts) hc.ExtraHosts = hostConfig.ExtraHosts;
+  if (hostConfig.CapAdd && hostConfig.CapAdd.length > 0) hc.CapAdd = hostConfig.CapAdd;
+  if (hostConfig.CapDrop && hostConfig.CapDrop.length > 0) hc.CapDrop = hostConfig.CapDrop;
+  if (hostConfig.Sysctls && Object.keys(hostConfig.Sysctls).length > 0) hc.Sysctls = hostConfig.Sysctls;
+  createOpts.HostConfig = hc;
+  if (data.NetworkSettings?.Networks && Object.keys(data.NetworkSettings.Networks).length > 0) {
+    createOpts.NetworkingConfig = {
+      EndpointsConfig: Object.fromEntries(
+        Object.entries(data.NetworkSettings.Networks).map(([net, cfg]) => [
+          net,
+          { Aliases: cfg.Aliases || [], Links: cfg.Links || [] }
+        ])
+      )
+    };
+  }
+  return createOpts;
+}
+
+/**
+ * Recreate this container using Docker API only: same params as current (as if composed), new image.
+ * Creates a new container with same config, starts it with env so it takes over this container's name, then exits.
  */
 async function recreateViaDockerApi(newImageUrl) {
   const cid = getOwnContainerId();
@@ -1460,31 +1482,16 @@ async function recreateViaDockerApi(newImageUrl) {
   try {
     const container = docker.getContainer(cid);
     const data = await container.inspect();
-    const config = data.Config || {};
-    const hostConfig = data.HostConfig || {};
     const name = (data.Name || '').replace(/^\//, '') || 'aionqa-helper';
     const newName = `${name}-new-${Date.now().toString(36)}`;
-    const createOpts = {
-      Image: newImageUrl,
-      Cmd: config.Cmd,
-      Env: config.Env || [],
-      WorkingDir: config.WorkingDir,
-      HostConfig: {
-        NetworkMode: hostConfig.NetworkMode || 'default',
-        Binds: hostConfig.Binds || [],
-        PortBindings: hostConfig.PortBindings,
-        RestartPolicy: hostConfig.RestartPolicy || { Name: 'unless-stopped' },
-        AutoRemove: false
-      },
-      name: newName
-    };
-    if (hostConfig.Mounts && hostConfig.Mounts.length > 0) {
-      createOpts.HostConfig.Mounts = hostConfig.Mounts;
-    }
-    console.log(`🔄 [SELF-UPDATE] Creating new container from ${newImageUrl} as ${newName}...`);
+    const createOpts = buildCreateOptsFromInspect(data, newImageUrl, newName, {
+      OLD_HELPER_CONTAINER_ID: cid,
+      ORIGINAL_HELPER_NAME: name
+    });
+    console.log(`🔄 [SELF-UPDATE] Creating new container from ${newImageUrl} (same params as current), temp name ${newName}...`);
     const newContainer = await docker.createContainer(createOpts);
     await newContainer.start();
-    console.log(`✅ [SELF-UPDATE] New container started. Exiting so this container can be replaced.`);
+    console.log(`✅ [SELF-UPDATE] New container started; it will take over name "${name}". Exiting.`);
     process.exit(0);
   } catch (err) {
     console.warn(`⚠️ [SELF-UPDATE] Docker API recreate failed: ${err.message}.`);
@@ -1493,22 +1500,19 @@ async function recreateViaDockerApi(newImageUrl) {
 }
 
 /**
- * Update helper image (pull if needed) and recreate container immediately.
- * Discovers compose project from container labels, or uses Docker API to start replacement container (no compose).
+ * Update helper image (pull if needed) and recreate container via Docker API with same params (no compose).
  */
 async function runHelperSelfUpdate() {
-  console.log(`🔄 [SELF-UPDATE] Updating helper image (pull then recreate container).`);
+  console.log(`🔄 [SELF-UPDATE] Updating helper image (pull then recreate container with same params).`);
   const result = await updateHelperImage();
-  if (result.safeToRestart) {
-    console.log(`✅ [SELF-UPDATE] New image downloaded. Recreating container...`);
-    const recreated = await runComposeRecreate();
-    if (recreated) return;
-    if (result.imageUrl) {
-      await recreateViaDockerApi(result.imageUrl);
+  if (result.safeToRestart && result.imageUrl) {
+    console.log(`✅ [SELF-UPDATE] New image downloaded. Recreating container (Docker API, same config)...`);
+    const done = await recreateViaDockerApi(result.imageUrl);
+    if (!done) {
+      console.log(`ℹ️ [SELF-UPDATE] Recreate failed. Restart the container manually to use the new image.`);
     }
-    console.log(`ℹ️ [SELF-UPDATE] Could not recreate automatically. Run: docker compose up -d --force-recreate (or restart the container).`);
   } else {
-    console.warn(`⚠️ [SELF-UPDATE] Could not update: ${result.reason}. Restart container manually if needed.`);
+    console.warn(`⚠️ [SELF-UPDATE] Could not update: ${result.reason || 'no image URL'}. Restart container manually if needed.`);
   }
 }
 
@@ -1627,6 +1631,9 @@ async function runPendingContainerActions() {
  * Main loop
  */
 async function main() {
+  // If we are the new container after a self-update, take over the original name (stop old, rename self)
+  await runSelfUpdateTakeoverIfNeeded();
+
   // Register engine with retries
   let registered = false;
   let registrationRetries = 10;
