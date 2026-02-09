@@ -689,42 +689,38 @@ async function startCrawlerContainer(job) {
 }
 
 /**
- * Monitor container status
+ * Monitor container: wait for it to exit, then notify backend and remove container.
+ * (Previously only inspected once, so we never saw "exited" and never called /completed.)
  */
 async function monitorContainer(container, jobId) {
   try {
-    const containerInfo = await container.inspect();
-    
-    if (containerInfo.State.Status === 'exited') {
-      runningContainers.delete(container.id);
-      
-      const exitCode = containerInfo.State.ExitCode;
-      console.log(`📦 Container ${container.id.substring(0, 12)} exited with code ${exitCode} for job ${jobId}`);
-      
-      // Notify backend
-      try {
-        await axios.post(
-          `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/jobs/${jobId}/completed`,
-          {
-            container_id: container.id,
-            exit_code: exitCode
-          },
-          { headers: getAuthHeaders() }
-        );
-      } catch (error) {
-        console.error(`⚠️ Failed to notify backend of container completion:`, error.message);
-      }
+    const waitResult = await container.wait();
+    const exitCode = waitResult?.StatusCode ?? waitResult?.ExitCode ?? 0;
+    runningContainers.delete(container.id);
 
-      // Remove exited container so it does not stay on the host
-      try {
-        await container.remove();
-        console.log(`🧹 Removed exited container ${container.id.substring(0, 12)} for job ${jobId}`);
-      } catch (removeError) {
-        console.warn(`⚠️ Failed to remove exited container: ${removeError.message}`);
-      }
+    console.log(`📦 Container ${container.id.substring(0, 12)} exited with code ${exitCode} for job ${jobId}`);
+
+    try {
+      await axios.post(
+        `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/jobs/${jobId}/completed`,
+        {
+          container_id: container.id,
+          exit_code: exitCode
+        },
+        { headers: getAuthHeaders() }
+      );
+    } catch (error) {
+      console.error(`⚠️ Failed to notify backend of container completion:`, error.message);
+    }
+
+    try {
+      await container.remove();
+      console.log(`🧹 Removed exited container ${container.id.substring(0, 12)} for job ${jobId}`);
+    } catch (removeError) {
+      console.warn(`⚠️ Failed to remove exited container: ${removeError.message}`);
     }
   } catch (error) {
-    console.error(`⚠️ Error monitoring container:`, error.message);
+    console.error(`⚠️ Error monitoring container for job ${jobId}:`, error.message);
   }
 }
 
