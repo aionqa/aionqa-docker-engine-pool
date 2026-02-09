@@ -944,16 +944,17 @@ async function fetchHelperConfig() {
 
 /**
  * Use Ollama as LLM backend (default). Set use_lm_studio_host (API) or USE_LM_STUDIO_HOST (env) to use host LM Studio.
- * When config has not been loaded yet, return false so we do not start Ollama (avoids starting Ollama when user selected LM Studio but config fetch failed or was delayed).
+ * When config has not been loaded yet, return false so we do not start Ollama.
+ * API config (ai_service_provider) wins over env so UI choice is respected.
  */
 function useOllamaAsLLM() {
+  if (!helperConfig) return false; // No config loaded yet - do not start Ollama
+  const provider = helperConfig.ai_service_provider || 'ollama';
+  if (provider === 'lm_studio' || provider === 'openai') return false; // UI chose LM Studio or OpenAI
+  if (helperConfig.use_lm_studio_host === true) return false;
   if (process.env.USE_LM_STUDIO_HOST !== undefined) {
     return process.env.USE_LM_STUDIO_HOST !== 'true' && process.env.USE_LM_STUDIO_HOST !== '1';
   }
-  if (!helperConfig) return false; // No config loaded yet - do not start Ollama; reconcileServices will retry fetch
-  const provider = helperConfig.ai_service_provider || 'ollama';
-  if (provider === 'lm_studio' || provider === 'openai') return false;
-  if (helperConfig.use_lm_studio_host === true) return false;
   return true;
 }
 
