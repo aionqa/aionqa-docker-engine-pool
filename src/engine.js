@@ -8,6 +8,7 @@ import axios from 'axios';
 import { hostname, cpus } from 'os';
 import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
+import { readFileSync } from 'fs';
 
 // Default to 'back' service name for docker-compose networks
 // In Docker Compose, services are resolved by service name, not container name
@@ -392,10 +393,13 @@ async function pollForJobs() {
       console.log(`🔄 [POLL] Restart requested; updating helper image then recreating container.`);
       const result = await updateHelperImage();
       if (result.safeToRestart) {
-        console.log(`✅ [POLL] Helper image updated.`);
-        const recreated = runComposeRecreate();
+        console.log(`✅ [POLL] Helper image updated. Recreating...`);
+        const recreated = await runComposeRecreate();
+        if (!recreated && result.imageUrl) {
+          await recreateViaDockerApi(result.imageUrl);
+        }
         if (!recreated) {
-          console.log(`ℹ️ [POLL] Set COMPOSE_PROJECT_DIR to recreate automatically. Otherwise run: docker compose up -d --force-recreate`);
+          console.log(`ℹ️ [POLL] Could not recreate automatically. Run: docker compose up -d --force-recreate (or restart the container).`);
         }
       } else {
         console.warn(`⚠️ [POLL] Could not update: ${result.reason}. Restart container manually if needed.`);
@@ -796,7 +800,7 @@ async function updateHelperImage() {
         });
         if (localImage) {
           console.log(`✅ Helper image is up to date (SHA matches)`);
-          return { safeToRestart: true };
+          return { safeToRestart: true, imageUrl };
         }
       } catch (checkError) {
         console.error(`❌ Error comparing SHA: ${checkError.message}; skipping SHA check, will pull`);
@@ -817,7 +821,7 @@ async function updateHelperImage() {
       });
     });
     console.log(`✅ Helper image updated successfully`);
-    return { safeToRestart: true };
+    return { safeToRestart: true, imageUrl };
   } catch (error) {
     console.warn(`⚠️ Failed to update helper image: ${error.message}`);
     return { safeToRestart: false, reason: error.message };
@@ -1375,13 +1379,62 @@ async function startAIServiceContainer() {
 }
 
 /**
- * Run docker compose up -d --force-recreate when COMPOSE_PROJECT_DIR is set.
- * Returns true if recreate was run (and may have succeeded; process may exit when container is recreated).
+ * Get this process's container ID (when running inside Docker).
+ * Reads /proc/self/cgroup and parses Docker container id.
+ * @returns {string|null} Full or short container ID, or null
  */
-function runComposeRecreate() {
-  const composeDir = process.env.COMPOSE_PROJECT_DIR || process.env.COMPOSE_PROJECT_DIRECTORY;
+function getOwnContainerId() {
+  try {
+    const cgroup = readFileSync('/proc/self/cgroup', 'utf8');
+    const lines = cgroup.split('\n');
+    for (const line of lines) {
+      const m = line.match(/[0-9]+:[^:]*:(?:\/docker\/)?([a-f0-9]{64}|[a-f0-9]{12})(?:\.scope)?$/);
+      if (m) return m[1];
+      const m2 = line.match(/[0-9]+:[^:]*:.*\/docker-([a-f0-9]{64}|[a-f0-9]{12})\.scope$/);
+      if (m2) return m2[1];
+      const m3 = line.match(/[0-9]+:[^:]*:.*\/([a-f0-9]{64}|[a-f0-9]{12})$/);
+      if (m3) return m3[1];
+    }
+    if (hostname() && /^[a-f0-9]{12}$/.test(hostname())) return hostname();
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * Get compose project working dir (and optional config file) from this container's labels.
+ * Works when the container was started by Docker Compose (labels are set automatically).
+ * @returns {Promise<{ workingDir: string, configFiles?: string } | null>}
+ */
+async function getComposeProjectFromLabels() {
+  const cid = getOwnContainerId();
+  if (!cid) return null;
+  try {
+    const container = docker.getContainer(cid);
+    const data = await container.inspect();
+    const labels = data.Config?.Labels || {};
+    const workingDir = labels['com.docker.compose.project.working_dir'];
+    const configFiles = labels['com.docker.compose.project.config_files'];
+    if (workingDir) return { workingDir, configFiles: configFiles || undefined };
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * Run docker compose up -d --force-recreate.
+ * Discovers project dir from container labels (compose) or from env COMPOSE_PROJECT_DIR.
+ * Returns true if recreate was run successfully.
+ */
+async function runComposeRecreate() {
+  let composeDir = null;
+  let composeFile = null;
+  const fromLabels = await getComposeProjectFromLabels();
+  if (fromLabels) {
+    composeDir = fromLabels.workingDir;
+    if (fromLabels.configFiles) composeFile = fromLabels.configFiles.split(',')[0]?.trim();
+  }
+  if (!composeDir) composeDir = process.env.COMPOSE_PROJECT_DIR || process.env.COMPOSE_PROJECT_DIRECTORY;
   if (!composeDir) return false;
-  const composeFile = process.env.COMPOSE_FILE;
+  if (!composeFile) composeFile = process.env.COMPOSE_FILE;
   try {
     const cmd = composeFile
       ? `docker compose -f "${composeFile}" up -d --force-recreate`
@@ -1391,24 +1444,69 @@ function runComposeRecreate() {
     console.log(`✅ [SELF-UPDATE] Recreate completed. Container should be running new image.`);
     return true;
   } catch (err) {
-    console.warn(`⚠️ [SELF-UPDATE] Recreate failed: ${err.message}. Recreate the container manually (e.g. docker compose up -d --force-recreate).`);
+    console.warn(`⚠️ [SELF-UPDATE] Recreate failed: ${err.message}.`);
     return false;
   }
 }
 
 /**
- * Update helper image (backend URL + image_sha, pull only if needed).
- * If download succeeds and COMPOSE_PROJECT_DIR is set, runs docker compose up -d --force-recreate immediately.
+ * Recreate this container using Docker API only (no compose).
+ * Creates a new container from newImageUrl with same config as current, starts it, then exits (current container stops).
+ * New container will have a different name (current name + "-new"); one container running.
+ */
+async function recreateViaDockerApi(newImageUrl) {
+  const cid = getOwnContainerId();
+  if (!cid || !newImageUrl) return false;
+  try {
+    const container = docker.getContainer(cid);
+    const data = await container.inspect();
+    const config = data.Config || {};
+    const hostConfig = data.HostConfig || {};
+    const name = (data.Name || '').replace(/^\//, '') || 'aionqa-helper';
+    const newName = `${name}-new-${Date.now().toString(36)}`;
+    const createOpts = {
+      Image: newImageUrl,
+      Cmd: config.Cmd,
+      Env: config.Env || [],
+      WorkingDir: config.WorkingDir,
+      HostConfig: {
+        NetworkMode: hostConfig.NetworkMode || 'default',
+        Binds: hostConfig.Binds || [],
+        PortBindings: hostConfig.PortBindings,
+        RestartPolicy: hostConfig.RestartPolicy || { Name: 'unless-stopped' },
+        AutoRemove: false
+      },
+      name: newName
+    };
+    if (hostConfig.Mounts && hostConfig.Mounts.length > 0) {
+      createOpts.HostConfig.Mounts = hostConfig.Mounts;
+    }
+    console.log(`🔄 [SELF-UPDATE] Creating new container from ${newImageUrl} as ${newName}...`);
+    const newContainer = await docker.createContainer(createOpts);
+    await newContainer.start();
+    console.log(`✅ [SELF-UPDATE] New container started. Exiting so this container can be replaced.`);
+    process.exit(0);
+  } catch (err) {
+    console.warn(`⚠️ [SELF-UPDATE] Docker API recreate failed: ${err.message}.`);
+    return false;
+  }
+}
+
+/**
+ * Update helper image (pull if needed) and recreate container immediately.
+ * Discovers compose project from container labels, or uses Docker API to start replacement container (no compose).
  */
 async function runHelperSelfUpdate() {
-  console.log(`🔄 [SELF-UPDATE] Updating helper image (pull only; recreate container to run new image).`);
+  console.log(`🔄 [SELF-UPDATE] Updating helper image (pull then recreate container).`);
   const result = await updateHelperImage();
   if (result.safeToRestart) {
-    console.log(`✅ [SELF-UPDATE] New image downloaded.`);
-    const recreated = runComposeRecreate();
-    if (!recreated) {
-      console.log(`ℹ️ [SELF-UPDATE] Set COMPOSE_PROJECT_DIR to recreate automatically. Otherwise run: docker compose up -d --force-recreate`);
+    console.log(`✅ [SELF-UPDATE] New image downloaded. Recreating container...`);
+    const recreated = await runComposeRecreate();
+    if (recreated) return;
+    if (result.imageUrl) {
+      await recreateViaDockerApi(result.imageUrl);
     }
+    console.log(`ℹ️ [SELF-UPDATE] Could not recreate automatically. Run: docker compose up -d --force-recreate (or restart the container).`);
   } else {
     console.warn(`⚠️ [SELF-UPDATE] Could not update: ${result.reason}. Restart container manually if needed.`);
   }

@@ -21,8 +21,8 @@ This service allows you to run crawling jobs on remote Docker engines instead of
 - `ENGINE_ID` - Unique engine identifier (auto-generated if not provided)
 - `POLL_INTERVAL` - Poll interval in milliseconds (default: 5000)
 - `DOCKER_SOCKET` - Docker socket path (default: `/var/run/docker.sock`)
-- `COMPOSE_PROJECT_DIR` - When set, after a self-update (new image downloaded) the engine runs `docker compose up -d --force-recreate` from this directory so the container is recreated immediately with the new image. Omit to only log instructions and recreate manually.
-- `COMPOSE_FILE` - Optional path to compose file (e.g. `docker-compose.yml`) when using `COMPOSE_PROJECT_DIR`.
+
+**Self-update (no extra env required):** When an update is requested, the app pulls the new image and then recreates the container automatically. It discovers the compose project from the container’s own labels (`com.docker.compose.project.working_dir`) when run via Docker Compose, and runs `docker compose up -d --force-recreate`. If not run via Compose, it uses the Docker API to create and start a new container from the new image (same config) and exits so the old container stops. Optional: `COMPOSE_PROJECT_DIR` and `COMPOSE_FILE` override auto-discovery.
 
 ### Running
 
