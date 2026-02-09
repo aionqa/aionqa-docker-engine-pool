@@ -934,7 +934,8 @@ async function fetchHelperConfig() {
     );
     if (response.data && response.data.config) {
       helperConfig = response.data.config;
-      console.log(`✅ Helper config loaded from API (e.g. ollama_model: ${helperConfig.ollama_model})`);
+      const provider = helperConfig.ai_service_provider || 'ollama';
+      console.log(`✅ Helper config loaded from API (ai_service_provider: ${provider}, ollama_model: ${helperConfig.ollama_model})`);
     }
   } catch (error) {
     console.warn(`⚠️ Could not fetch helper config (using env/defaults): ${error.message}`);
@@ -1185,7 +1186,11 @@ async function stopAndRemoveAIServiceContainer() {
 async function reconcileServices() {
   try {
     await fetchHelperConfig();
-    if (isOllamaEnabled()) {
+    const provider = helperConfig?.ai_service_provider || 'ollama';
+    const useOllama = useOllamaAsLLM();
+    const ollamaEnabled = isOllamaEnabled();
+    console.log(`🔄 [RECONCILE] ai_service_provider=${provider} useOllamaAsLLM=${useOllama} isOllamaEnabled=${ollamaEnabled}`);
+    if (ollamaEnabled) {
       await startOllamaContainer();
     } else {
       await stopAndRemoveOllamaContainer();
@@ -1365,13 +1370,15 @@ async function startAIServiceContainer() {
 }
 
 /**
- * Update helper image (backend URL + image_sha, pull only if needed) then exit only if update path was clear.
+ * Update helper image (backend URL + image_sha, pull only if needed).
+ * The new image is downloaded and stored on disk; the currently running process is still the old image.
+ * To run the new image you must recreate the container (e.g. docker compose up -d --force-recreate).
  */
 async function runHelperSelfUpdate() {
-  console.log(`🔄 [SELF-UPDATE] Updating helper image; will exit only if update path is clear.`);
+  console.log(`🔄 [SELF-UPDATE] Updating helper image (pull only; recreate container to run new image).`);
   const result = await updateHelperImage();
   if (result.safeToRestart) {
-    console.log(`✅ [SELF-UPDATE] Helper image updated. Restart the container manually (e.g. docker compose up -d --force-recreate) to use it.`);
+    console.log(`✅ [SELF-UPDATE] New image downloaded. Recreate the container to use it (e.g. docker compose up -d --force-recreate).`);
   } else {
     console.warn(`⚠️ [SELF-UPDATE] Could not update: ${result.reason}. Restart container manually if needed.`);
   }
