@@ -1622,6 +1622,111 @@ async function runPendingContainerActions() {
 }
 
 /**
+ * Run pending AI-only requests from the backend (no crawler container).
+ * Helper polls, executes LLM call via configured AI service, posts result, then acks.
+ */
+function resolveAiServiceUrl(choice = 'default', preferredUrl = '') {
+  const c = String(choice || 'default').toLowerCase();
+  if (c === 'shared') return 'https://ai.aionqa.com';
+  if (c === 'specific' && preferredUrl) return String(preferredUrl);
+  // default: use helper config's ai_services first (self-hosted / local), else fall back to local container name.
+  const fromConfig = helperConfig?.ai_services && Array.isArray(helperConfig.ai_services) ? helperConfig.ai_services : [];
+  const first = fromConfig.find(s => s && typeof s.url === 'string' && s.url.trim());
+  return first?.url || 'http://aionqa-ai-service:5000';
+}
+
+async function runPendingAIRequests() {
+  try {
+    const response = await axios.get(
+      `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/pending-ai-requests`,
+      { headers: getAuthHeaders(), timeout: 5000 }
+    );
+    const pending = response.data?.pending || [];
+    if (!Array.isArray(pending) || pending.length === 0) return;
+
+    // Execute sequentially to avoid overloading the AI service.
+    for (const reqItem of pending) {
+      const requestId = reqItem?.id;
+      const projectId = reqItem?.project_id;
+      const jobId = reqItem?.job_id;
+      const model = reqItem?.model || 'gpt-5-mini';
+      const aiChoice = reqItem?.ai_service_choice || 'default';
+      const preferredUrl = reqItem?.preferred_ai_service_url || '';
+      const messages = Array.isArray(reqItem?.messages) ? reqItem.messages : [];
+
+      if (!requestId || !projectId || !jobId || messages.length === 0) {
+        console.warn(`[HELPER-AI] Skipping invalid AI request payload:`, {
+          requestId, hasProjectId: !!projectId, hasJobId: !!jobId, messagesCount: messages.length
+        });
+        continue;
+      }
+
+      const aiServiceUrl = resolveAiServiceUrl(aiChoice, preferredUrl);
+      console.log(`[HELPER-AI] Executing AI request ${requestId} via ${aiServiceUrl} (choice=${aiChoice}, model=${model})`);
+
+      let success = false;
+      let responseText = '';
+      let errorText = '';
+
+      try {
+        // 1) Mint AI service token for this job (required by aionqa-ai-service)
+        const tokenResp = await axios.post(
+          `${BACKEND_URL}/api/ai/issue-token`,
+          { project_id: projectId, job_id: jobId },
+          { headers: getAuthHeaders(), timeout: 10000 }
+        );
+        const aiToken = tokenResp.data?.token;
+        if (!aiToken) throw new Error('No ai service token returned');
+
+        // 2) Call AI service
+        const aiResp = await axios.post(
+          `${aiServiceUrl.replace(/\/$/, '')}/api/ai/chat`,
+          { project_id: projectId, job_id: jobId, messages, model },
+          {
+            headers: { Authorization: `Bearer ${aiToken}` },
+            timeout: 120000
+          }
+        );
+        responseText = String(aiResp.data?.output_text || aiResp.data?.output?.[0]?.text || '').trim();
+        if (!responseText) {
+          // fallback: keep small JSON
+          responseText = JSON.stringify(aiResp.data || {}).slice(0, 4000);
+        }
+        success = true;
+      } catch (err) {
+        errorText = err.response?.data?.error?.message || err.response?.data?.error || err.message || 'AI request failed';
+        console.warn(`[HELPER-AI] Request ${requestId} failed: ${errorText}`);
+      }
+
+      // 3) Post result to backend
+      try {
+        await axios.post(
+          `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/ai-requests/${requestId}/result`,
+          { job_id: jobId, success, response: responseText, error: success ? null : errorText },
+          { headers: getAuthHeaders(), timeout: 10000 }
+        );
+      } catch (postErr) {
+        console.warn(`[HELPER-AI] Failed to post result for ${requestId}: ${postErr.message}`);
+      }
+
+      // 4) Ack so it is removed from queue
+      try {
+        await axios.post(
+          `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/pending-ai-requests/ack`,
+          { ids: [requestId] },
+          { headers: getAuthHeaders(), timeout: 10000 }
+        );
+      } catch (ackErr) {
+        console.warn(`[HELPER-AI] Ack failed for ${requestId}: ${ackErr.message}`);
+      }
+    }
+  } catch (err) {
+    if (err.response?.status === 404) return; // backend not yet updated
+    console.warn(`[HELPER-AI] Pending AI requests: ${err.message}`);
+  }
+}
+
+/**
  * Main loop
  */
 async function main() {
@@ -1681,6 +1786,7 @@ async function main() {
   while (true) {
     try {
       runPendingContainerActions().catch(() => {});
+      runPendingAIRequests().catch(() => {});
       pollCount++;
       const job = await pollForJobs();
       
