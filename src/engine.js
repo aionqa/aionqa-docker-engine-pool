@@ -604,7 +604,11 @@ async function startCrawlerContainer(job) {
         NetworkMode: (helperConfig && helperConfig.crawler_network) || process.env.CRAWLER_NETWORK || 'aionqa-network',
         AutoRemove: false, // Helper removes containers when not running (see monitorContainer + cleanupContainers)
         RestartPolicy: { Name: 'no' }, // Don't restart
-        Binds: ['/var/run/docker.sock:/var/run/docker.sock'] // Mount docker socket for video recording
+        Binds: ['/var/run/docker.sock:/var/run/docker.sock'], // Mount docker socket for video recording
+        LogConfig: {
+          Type: 'json-file',
+          Config: { 'max-size': '10m', 'max-file': '3' }
+        }
       },
       Labels: {
         'aionqa.job_id': job_id,
