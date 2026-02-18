@@ -392,13 +392,14 @@ async function pollForJobs() {
       console.log(`🔄 [POLL] Restart requested; updating helper image then recreating container.`);
       const result = await updateHelperImage();
       if (result.safeToRestart) {
-        console.log(`✅ [POLL] Helper image updated. Recreating...`);
-        const recreated = await runComposeRecreate();
-        if (!recreated && result.imageUrl) {
-          await recreateViaDockerApi(result.imageUrl);
-        }
-        if (!recreated) {
-          console.log(`ℹ️ [POLL] Could not recreate automatically. Run: docker compose up -d --force-recreate (or restart the container).`);
+        console.log(`✅ [POLL] Helper image updated. Recreating via Docker API...`);
+        if (result.imageUrl) {
+          const ok = await recreateViaDockerApi(result.imageUrl);
+          if (!ok) {
+            console.log(`ℹ️ [POLL] Could not recreate automatically. Restart the helper container manually to use the new image.`);
+          }
+        } else {
+          console.warn(`⚠️ [POLL] No imageUrl returned; restart helper container manually.`);
         }
       } else {
         console.warn(`⚠️ [POLL] Could not update: ${result.reason}. Restart container manually if needed.`);
