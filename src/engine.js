@@ -928,6 +928,27 @@ const OLLAMA_CONTAINER_NAME = 'ollama';
 /** Helper config from API (fetched on startup; env overrides) */
 let helperConfig = null;
 
+function logStartupConfigSnapshot(source = 'api') {
+  try {
+    const c = helperConfig || {};
+    const snapshot = {
+      source,
+      engine_id: ENGINE_ID,
+      runner_id: RUNNER_ID,
+      max_concurrent_jobs: c.max_concurrent_jobs ?? null,
+      poll_interval: c.poll_interval ?? POLL_INTERVAL,
+      ai_service_enabled: c.ai_service_enabled ?? true,
+      ollama_enabled: c.ollama_enabled ?? true,
+      ai_service_provider: c.ai_service_provider || 'ollama',
+      ai_service_url: c.ai_service_url || null,
+      ai_services_count: Array.isArray(c.ai_services) ? c.ai_services.length : 0
+    };
+    console.log(`⚙️ [STARTUP CONFIG] ${JSON.stringify(snapshot)}`);
+  } catch (error) {
+    console.warn(`⚠️ [STARTUP CONFIG] Failed to print config snapshot: ${error.message}`);
+  }
+}
+
 /**
  * Fetch helper config from backend. Called on startup so params can be changed in UI and applied after restart.
  */
@@ -941,9 +962,11 @@ async function fetchHelperConfig() {
       helperConfig = response.data.config;
       const provider = helperConfig.ai_service_provider || 'ollama';
       console.log(`✅ Helper config loaded from API (ai_service_provider: ${provider}, ollama_model: ${helperConfig.ollama_model})`);
+      logStartupConfigSnapshot('api');
     }
   } catch (error) {
     console.warn(`⚠️ Could not fetch helper config (using env/defaults): ${error.message}`);
+    logStartupConfigSnapshot('env/default');
   }
 }
 
