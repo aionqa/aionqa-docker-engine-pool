@@ -46,6 +46,13 @@ console.log(`📅 Helper Build Date: ${HELPER_BUILD_DATE}`);
 // Note: We'll set authconfig per-pull, not globally
 const docker = new Docker({ socketPath: DOCKER_SOCKET });
 
+// Log driver that supports reading (docker logs). Required so we can read container logs
+// when a container exits; daemon default may be journald/awslogs which don't support reading.
+const LOG_CONFIG_JSON_FILE = {
+  Type: 'json-file',
+  Config: { 'max-size': '10m', 'max-file': '3' }
+};
+
 // Track running containers (containerId -> jobId)
 const runningContainers = new Map();
 
@@ -606,10 +613,7 @@ async function startCrawlerContainer(job) {
         AutoRemove: false, // Helper removes containers when not running (see monitorContainer + cleanupContainers)
         RestartPolicy: { Name: 'no' }, // Don't restart
         Binds: ['/var/run/docker.sock:/var/run/docker.sock'], // Mount docker socket for video recording
-        LogConfig: {
-          Type: 'json-file',
-          Config: { 'max-size': '10m', 'max-file': '3' }
-        }
+        LogConfig: LOG_CONFIG_JSON_FILE
       },
       Labels: {
         'aionqa.job_id': job_id,
@@ -637,7 +641,12 @@ async function startCrawlerContainer(job) {
         const logs = await container.logs({ stdout: true, stderr: true, tail: 50 });
         console.error(`Container logs:`, logs.toString());
       } catch (logError) {
-        console.error(`Failed to get container logs:`, logError.message);
+        const msg = logError.message || '';
+        if (msg.includes('does not support reading')) {
+          console.error(`Container logs unavailable (daemon log driver does not support reading). Ensure containers use json-file log driver.`);
+        } else {
+          console.error(`Failed to get container logs:`, msg);
+        }
       }
 
       // Remove container so it does not stay on the host
@@ -1104,7 +1113,8 @@ async function startOllamaContainer() {
       NetworkMode: networkName,
       RestartPolicy: { Name: 'unless-stopped' },
       PortBindings: { '11434/tcp': [{ HostPort: '11434' }] },
-      Binds: ['ollama-models:/root/.ollama']
+      Binds: ['ollama-models:/root/.ollama'],
+      LogConfig: LOG_CONFIG_JSON_FILE
     };
     const memGb = process.env.OLLAMA_MEMORY_GB || process.env.OLLAMA_CONTAINER_MEMORY_GB || (helperConfig && helperConfig.ollama_memory_gb != null && helperConfig.ollama_memory_gb !== '' ? helperConfig.ollama_memory_gb : null);
     if (memGb != null && memGb !== '' && /^\d+$/.test(String(memGb).trim())) {
@@ -1389,7 +1399,8 @@ async function startAIServiceContainer(useCachedConfig = false) {
       HostConfig: {
         PortBindings: { '5000/tcp': [{ HostPort: '5000' }] },
         NetworkMode: networkName,
-        RestartPolicy: { Name: 'unless-stopped' }
+        RestartPolicy: { Name: 'unless-stopped' },
+        LogConfig: LOG_CONFIG_JSON_FILE
       }
     });
     await container.start();
@@ -1473,7 +1484,8 @@ function buildCreateOptsFromInspect(data, newImageUrl, newName, extraEnv) {
     Binds: hostConfig.Binds || [],
     PortBindings: hostConfig.PortBindings || {},
     RestartPolicy: hostConfig.RestartPolicy || { Name: 'unless-stopped' },
-    AutoRemove: false
+    AutoRemove: false,
+    LogConfig: hostConfig.LogConfig && hostConfig.LogConfig.Type === 'json-file' ? hostConfig.LogConfig : LOG_CONFIG_JSON_FILE
   };
   if (hostConfig.Mounts && hostConfig.Mounts.length > 0) hc.Mounts = hostConfig.Mounts;
   if (hostConfig.ExtraHosts) hc.ExtraHosts = hostConfig.ExtraHosts;
