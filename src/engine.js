@@ -584,25 +584,26 @@ async function startCrawlerContainer(job) {
     
     // Generate container name: aionqa-crawler-job-{jobId}
     const containerName = `aionqa-crawler-job-${job_id}`;
-    
-    // Clean up any existing container with the same name (from previous failed attempts)
+
+    // Customer isolation: never reuse a container. Always create a new one from the image
+    // so that no data or state from a previous job (possibly another customer) can leak.
     try {
       const existingContainer = docker.getContainer(containerName);
       const containerInfo = await existingContainer.inspect();
       if (containerInfo) {
-        console.log(`🧹 Cleaning up existing container: ${containerName}`);
+        console.log(`🧹 Cleaning up existing container: ${containerName} (always use fresh container for isolation)`);
         try {
           await existingContainer.stop();
         } catch (stopError) {
           // Container might already be stopped, ignore
         }
-        await existingContainer.remove();
+        await existingContainer.remove({ force: true, v: true });
         console.log(`✅ Removed existing container: ${containerName}`);
       }
     } catch (notFoundError) {
       // Container doesn't exist, that's fine - continue
     }
-    
+
     const container = await docker.createContainer({
       Image: image_url,
       name: containerName, // Use consistent naming pattern
@@ -649,9 +650,9 @@ async function startCrawlerContainer(job) {
         }
       }
 
-      // Remove container so it does not stay on the host
+      // Remove container so it does not stay on the host (force + volumes for isolation)
       try {
-        await container.remove();
+        await container.remove({ force: true, v: true });
         console.log(`🧹 Removed failed container ${containerName}`);
       } catch (removeError) {
         console.warn(`⚠️ Failed to remove container: ${removeError.message}`);
@@ -725,7 +726,7 @@ async function monitorContainer(container, jobId) {
     }
 
     try {
-      await container.remove();
+      await container.remove({ force: true, v: true });
       console.log(`🧹 Removed exited container ${container.id.substring(0, 12)} for job ${jobId}`);
     } catch (removeError) {
       console.warn(`⚠️ Failed to remove exited container: ${removeError.message}`);
@@ -750,7 +751,7 @@ async function cleanupContainers() {
         try {
           const container = docker.getContainer(containerInfo.Id);
           const jobId = runningContainers.get(containerInfo.Id);
-          await container.remove();
+          await container.remove({ force: true, v: true });
           runningContainers.delete(containerInfo.Id);
           // Also remove from processing set if it was there
           if (jobId) {
