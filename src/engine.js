@@ -961,23 +961,33 @@ function logStartupConfigSnapshot(source = 'api') {
 
 /**
  * Fetch helper config from backend. Called on startup so params can be changed in UI and applied after restart.
+ * Throws on failure (missing config, backend down, invalid token). Caller must handle or process will exit.
  */
 async function fetchHelperConfig() {
+  let response;
   try {
-    const response = await axios.get(
+    response = await axios.get(
       `${BACKEND_URL}/api/docker-engines/config`,
       { params: { engine_id: ENGINE_ID }, headers: getAuthHeaders(), timeout: 10000 }
     );
-    if (response.data && response.data.config) {
-      helperConfig = response.data.config;
-      const provider = helperConfig.ai_service_provider || 'ollama';
-      console.log(`✅ Helper config loaded from API (ai_service_provider: ${provider}, ollama_model: ${helperConfig.ollama_model})`);
-      logStartupConfigSnapshot('api');
-    }
   } catch (error) {
-    console.warn(`⚠️ Could not fetch helper config (using env/defaults): ${error.message}`);
-    logStartupConfigSnapshot('env/default');
+    const status = error.response?.status;
+    const msg = error.response?.data?.error || error.message;
+    if (status === 401 || status === 403) {
+      throw new Error(`Invalid or unauthorized ENGINE_TOKEN (${status}). Check Settings > Docker Engines > token.`);
+    }
+    if (status === 404) {
+      throw new Error(`Engine not found or not owned by this token (404). Check ENGINE_ID and backend.`);
+    }
+    throw new Error(`Helper config unavailable: ${msg || error.message}. Is the backend at ${BACKEND_URL} responding?`);
   }
+  if (!response.data || !response.data.config) {
+    throw new Error('Backend returned no config (missing response.data.config).');
+  }
+  helperConfig = response.data.config;
+  const provider = helperConfig.ai_service_provider || 'ollama';
+  console.log(`✅ Helper config loaded from API (ai_service_provider: ${provider}, ollama_model: ${helperConfig.ollama_model})`);
+  logStartupConfigSnapshot('api');
 }
 
 /**
@@ -1774,6 +1784,9 @@ async function main() {
   // If we are the new container after a self-update, take over the original name (stop old, rename self)
   await runSelfUpdateTakeoverIfNeeded();
 
+  // Require config before starting: missing config, backend down, or wrong token → throw and exit
+  await fetchHelperConfig();
+
   // Register engine with retries
   let registered = false;
   let registrationRetries = 10;
@@ -1932,14 +1945,8 @@ process.on('uncaughtException', (error) => {
 
 // Start main loop
 main().catch(error => {
-  console.error(`❌ Fatal error in main:`, error);
+  console.error(`❌ Fatal error in main:`, error.message);
   console.error(`   Stack:`, error.stack);
-  // Don't exit - try to continue
-  console.log('   Attempting to restart main loop in 5 seconds...');
-  setTimeout(() => {
-    main().catch(err => {
-      console.error(`❌ Failed to restart main loop:`, err);
-    });
-  }, 5000);
+  process.exit(1);
 });
 
