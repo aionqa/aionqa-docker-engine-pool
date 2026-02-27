@@ -565,14 +565,17 @@ async function startCrawlerContainer(job) {
       }
     }
 
-    // Create container
-    // Build environment variables. No AI_SERVICE_URL default - crawler gets ai_services from job context (GET /api/jobs/:id).
+    // Create container: crawler env must be provided by helper, from backend (token + url). Backend defaults url to api.aionqa.com.
+    const crawlerBackendUrl = backend_url || BACKEND_URL;
+    if (!backend_url) {
+      console.warn(`[ENGINE] Job did not include backend_url; using pool BACKEND_URL: ${crawlerBackendUrl}`);
+    }
     const containerEnv = [
       `JOB_ID=${job_id}`,
       `JOB_TYPE=${job_type || (job.job_type || (job.type === 'login' ? 'login' : 'crawl'))}`, // CRITICAL: Pass job type explicitly
       `TASK_MODE=single-job`, // Signal to crawler to exit after this job
-      `BACKEND_URL=${backend_url || BACKEND_URL}`,
-      `RUNNER_TOKEN=${runner_token}`, // Service-managed token from backend
+      `BACKEND_URL=${crawlerBackendUrl}`, // From backend (default api.aionqa.com); crawler uses this to poll and post results
+      `RUNNER_TOKEN=${runner_token}`, // From backend; required for crawler to authenticate
       `RUNNER_TYPE=service-managed`, // Mark as service-managed crawler
       `RUNNER_ID=container-${job_id}`,
       // CRITICAL: AI_SERVICE_TOKEN must NOT be passed to crawlers for security
