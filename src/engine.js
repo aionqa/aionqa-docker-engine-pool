@@ -1787,10 +1787,7 @@ async function main() {
   // If we are the new container after a self-update, take over the original name (stop old, rename self)
   await runSelfUpdateTakeoverIfNeeded();
 
-  // Require config before starting: missing config, backend down, or wrong token → throw and exit
-  await fetchHelperConfig();
-
-  // Register engine with retries
+  // Register engine first so it exists in the backend before we fetch config (config endpoint returns 404 otherwise)
   let registered = false;
   let registrationRetries = 10;
   while (!registered && registrationRetries > 0) {
@@ -1803,20 +1800,22 @@ async function main() {
         console.error(`❌ Failed to register engine after multiple attempts.`);
         console.warn(`⚠️  Continuing anyway - engine may already be registered in database.`);
         console.warn(`⚠️  Polling will continue, but heartbeats may fail.`);
-        // Don't exit - continue polling in case engine is pre-registered
-        registered = false; // Mark as not registered but continue
+        registered = false;
         break;
       }
       console.log(`   Waiting 5 seconds before retry...`);
       await new Promise(resolve => setTimeout(resolve, 5000));
     }
   }
-  
+
   if (registered) {
     console.log(`✅ Engine registration successful`);
   } else {
     console.warn(`⚠️  Engine registration failed - continuing with polling (engine may be pre-registered)`);
   }
+
+  // Require config after registration: missing config, backend down, or wrong token → throw and exit
+  await fetchHelperConfig();
 
   await ensureAionqaNetwork().catch(err => console.warn('⚠️ Ensure network failed:', err.message));
   // Load config and start Ollama / AI service once (reconcileServices fetches config; no need to fetch twice)
