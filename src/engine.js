@@ -182,7 +182,7 @@ function isAionqaRelatedContainer(containerInfo) {
   const names = (containerInfo.Names || []).join(' ');
   const labels = containerInfo.Labels || {};
   if (labels['aionqa.engine_id'] || labels['aionqa.job_id']) return true;
-  if (/aionqa|ollama|unified-crawler|aionqa-ai-service|aionqa-docker-engine/.test(names)) return true;
+  if (/aionqa|ollama|unified-crawler|aionqa-ai-service|ai-service-|aionqa-docker-engine/.test(names)) return true;
   return false;
 }
 
@@ -933,8 +933,13 @@ async function checkAllImages(skipHelper = false) {
   console.log(`✅ Image check complete`);
 }
 
-/** Default container name for the AI service (helper starts it with short-lived ECR token) */
-const AI_SERVICE_CONTAINER_NAME = 'aionqa-ai-service';
+/** Default container name for the AI service when ai_service_source is self_deployed (helper starts it with short-lived ECR token). */
+function getAIServiceContainerName() {
+  if (!helperConfig) return 'aionqa-ai-service';
+  if (helperConfig.ai_service_source === 'aionqa') return 'aionqa-ai-service';
+  const name = helperConfig.ai_service_container_name;
+  return (name && typeof name === 'string' && name.trim()) ? name.trim() : 'aionqa-ai-service';
+}
 /** Ollama container (default LLM when USE_LM_STUDIO_HOST is not set) */
 const OLLAMA_CONTAINER_NAME = 'ollama';
 
@@ -1018,8 +1023,9 @@ function isOllamaEnabled() {
   return helperConfig?.ollama_enabled !== false;
 }
 
-/** Whether to run the AI service container (config or env AI_SERVICE). When false, helper will stop and remove it. */
+/** Whether to run the AI service container (config or env AI_SERVICE). When false or ai_service_source is aionqa, helper will not run it. */
 function isAIServiceEnabled() {
+  if (helperConfig?.ai_service_source === 'aionqa') return false;
   if (process.env.AI_SERVICE === 'true' || process.env.AI_SERVICE === '1') return true;
   if (process.env.AI_SERVICE === 'false' || process.env.AI_SERVICE === '0') return false;
   return helperConfig?.ai_service_enabled !== false;
@@ -1214,19 +1220,23 @@ async function stopAndRemoveOllamaContainer() {
 }
 
 /**
- * Stop and remove the AI service container. Used when user turns "AI service" off in UI.
+ * Stop and remove the AI service container(s). Removes both the current config name and legacy aionqa-ai-service.
  */
 async function stopAndRemoveAIServiceContainer() {
+  const namesToRemove = [getAIServiceContainerName()];
+  if (!namesToRemove.includes('aionqa-ai-service')) namesToRemove.push('aionqa-ai-service');
   try {
     const containers = await docker.listContainers({ all: true });
-    const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === AI_SERVICE_CONTAINER_NAME));
-    if (!existing) return;
-    const container = docker.getContainer(existing.Id);
-    if (existing.State === 'running') {
-      await container.stop({ t: 10 }).catch(() => {});
+    for (const containerName of namesToRemove) {
+      const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === containerName));
+      if (!existing) continue;
+      const container = docker.getContainer(existing.Id);
+      if (existing.State === 'running') {
+        await container.stop({ t: 10 }).catch(() => {});
+      }
+      await container.remove({ force: true }).catch(() => {});
+      console.log(`🛑 AI service container stopped and removed: ${containerName}`);
     }
-    await container.remove({ force: true }).catch(() => {});
-    console.log(`🛑 AI service container stopped and removed`);
   } catch (error) {
     console.warn(`⚠️ Failed to stop/remove AI service container: ${error.message}`);
   }
@@ -1368,6 +1378,7 @@ function getAIServiceEnv() {
     const url = c.ai_service_lm_studio_url || process.env.AI_SERVICE_LM_STUDIO_URL || 'http://host.docker.internal:1234';
     const model = c.ai_service_lm_studio_model || process.env.LM_STUDIO_MODEL || 'qwen2.5-vl-3b-instruct-img2code';
     base.push('AI_MODE=lm-studio', `LM_STUDIO_URL=${url}`, `LM_STUDIO_MODEL=${model}`);
+    if (c.ai_service_lm_studio_api_key) base.push(`LM_STUDIO_API_KEY=${c.ai_service_lm_studio_api_key}`);
   } else {
     // ollama: AI service uses native Ollama API (POST /api/chat)
     const url = c.ai_service_ollama_url || 'http://ollama:11434';
@@ -1387,13 +1398,14 @@ async function startAIServiceContainer(useCachedConfig = false) {
   if (!useCachedConfig) await fetchHelperConfig();
   if (!isAIServiceEnabled()) return;
 
+  const containerName = getAIServiceContainerName();
   const imageUrl = await getAIServiceImageUrl();
   if (!imageUrl) return;
 
   const networkName = getConfigNetwork();
   try {
     const containers = await docker.listContainers({ all: true });
-    const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === AI_SERVICE_CONTAINER_NAME));
+    const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === containerName));
     if (existing && existing.State === 'running') {
       return; // Already running; do not recreate every 60s (avoids repeated image pulls)
     }
@@ -1407,7 +1419,7 @@ async function startAIServiceContainer(useCachedConfig = false) {
 
     const container = await docker.createContainer({
       Image: imageUrl,
-      name: AI_SERVICE_CONTAINER_NAME,
+      name: containerName,
       Env: env,
       ExposedPorts: { '5000/tcp': {} },
       HostConfig: {
@@ -1418,7 +1430,7 @@ async function startAIServiceContainer(useCachedConfig = false) {
       }
     });
     await container.start();
-    console.log(`✅ AI service container started: ${AI_SERVICE_CONTAINER_NAME} on network ${networkName}`);
+    console.log(`✅ AI service container started: ${containerName} on network ${networkName}`);
   } catch (error) {
     console.warn(`⚠️ Failed to start AI service container: ${error.message}`);
   }
@@ -1630,9 +1642,12 @@ async function runPendingContainerActions() {
             } else {
               console.log(`⏭️ Skipping start Ollama: config says use LM Studio / OpenAI`);
             }
-          } else if (normalizedName.includes('aionqa-ai-service')) {
-            await startAIServiceContainer();
-            console.log(`▶️ Started AI service`);
+          } else if (normalizedName.includes('ai-service') || normalizedName.includes('aionqa-ai-service')) {
+            await fetchHelperConfig();
+            if (normalizedName === getAIServiceContainerName().toLowerCase() || normalizedName.includes('aionqa-ai-service')) {
+              await startAIServiceContainer();
+              console.log(`▶️ Started AI service`);
+            }
           } else if (found) {
             const container = docker.getContainer(found.Id);
             await container.start();
@@ -1646,12 +1661,14 @@ async function runPendingContainerActions() {
             await stopAndRemoveOllamaContainer();
             await startOllamaContainer();
             console.log(`🔄 Updated Ollama`);
-          } else if (normalizedName.includes('aionqa-ai-service')) {
+          } else if (normalizedName.includes('ai-service') || normalizedName.includes('aionqa-ai-service')) {
             await fetchHelperConfig();
-            await stopAndRemoveAIServiceContainer();
-            await pullAIServiceImage(true);
-            await startAIServiceContainer(true);
-            console.log(`🔄 Updated AI service`);
+            if (normalizedName === getAIServiceContainerName().toLowerCase() || normalizedName.includes('aionqa-ai-service')) {
+              await stopAndRemoveAIServiceContainer();
+              await pullAIServiceImage(true);
+              await startAIServiceContainer(true);
+              console.log(`🔄 Updated AI service`);
+            }
           } else if (found) {
             const container = docker.getContainer(found.Id);
             if (found.State === 'running') await container.stop({ t: 10 }).catch(() => {});
