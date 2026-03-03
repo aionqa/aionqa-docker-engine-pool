@@ -936,7 +936,7 @@ async function checkAllImages(skipHelper = false) {
 /** Default container name for the AI service when ai_service_source is self_deployed (helper starts it with short-lived ECR token). */
 function getAIServiceContainerName() {
   if (!helperConfig) return 'aionqa-ai-service';
-  if (helperConfig.ai_service_source === 'aionqa') return 'aionqa-ai-service';
+  if (helperConfig.ai_service_source === 'aionqa' || helperConfig.ai_service_source === 'balance') return 'aionqa-ai-service';
   const name = helperConfig.ai_service_container_name;
   return (name && typeof name === 'string' && name.trim()) ? name.trim() : 'aionqa-ai-service';
 }
@@ -1023,9 +1023,9 @@ function isOllamaEnabled() {
   return helperConfig?.ollama_enabled !== false;
 }
 
-/** Whether to run the AI service container (config or env AI_SERVICE). When false or ai_service_source is aionqa, helper will not run it. */
+/** Whether to run the AI service container (config or env AI_SERVICE). When false or ai_service_source is aionqa/balance, helper will not run it. */
 function isAIServiceEnabled() {
-  if (helperConfig?.ai_service_source === 'aionqa') return false;
+  if (helperConfig?.ai_service_source === 'aionqa' || helperConfig?.ai_service_source === 'balance') return false;
   if (process.env.AI_SERVICE === 'true' || process.env.AI_SERVICE === '1') return true;
   if (process.env.AI_SERVICE === 'false' || process.env.AI_SERVICE === '0') return false;
   return helperConfig?.ai_service_enabled !== false;
