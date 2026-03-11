@@ -5,7 +5,7 @@
 
 import Docker from 'dockerode';
 import axios from 'axios';
-import { hostname, cpus } from 'os';
+import { hostname, cpus, platform, release, arch, networkInterfaces } from 'os';
 import { randomUUID } from 'crypto';
 import { readFileSync } from 'fs';
 
@@ -135,6 +135,31 @@ function getECRAuthConfig(tokenData) {
 }
 
 /**
+ * Gather system identification info for admin display (OS, arch, IP)
+ */
+function getSystemInfo() {
+  const info = {
+    os_platform: platform(),
+    os_release: release(),
+    os_arch: arch()
+  };
+  try {
+    const ifaces = networkInterfaces();
+    for (const name of Object.keys(ifaces || {})) {
+      for (const iface of ifaces[name] || []) {
+        if (iface.family === 'IPv4' && !iface.internal) {
+          info.ip = iface.address;
+          return info;
+        }
+      }
+    }
+  } catch (_) {
+    // ignore
+  }
+  return info;
+}
+
+/**
  * Register this engine with the backend
  */
 async function registerEngine() {
@@ -143,13 +168,15 @@ async function registerEngine() {
   
   while (retries > 0) {
     try {
+      const system_info = getSystemInfo();
       const response = await axios.post(
         `${BACKEND_URL}/api/docker-engines/register`,
         {
           engine_id: ENGINE_ID,
           hostname: hostname(),
           docker_socket: DOCKER_SOCKET,
-          status: 'active'
+          status: 'active',
+          system_info
         },
         { headers: getAuthHeaders() }
       );
@@ -362,6 +389,7 @@ async function sendHeartbeat() {
     } catch (err) {
       console.warn(`⚠️ Metrics collection failed:`, err.message);
     }
+    const system_info = getSystemInfo();
     await axios.post(
       `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/heartbeat`,
       {
@@ -369,7 +397,8 @@ async function sendHeartbeat() {
         running_containers: runningContainers.size,
         metrics,
         version: HELPER_VERSION,
-        build_date: HELPER_BUILD_DATE
+        build_date: HELPER_BUILD_DATE,
+        system_info
       },
       { headers: getAuthHeaders(), timeout: 15000 }
     );
