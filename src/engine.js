@@ -135,28 +135,82 @@ function getECRAuthConfig(tokenData) {
 }
 
 /**
- * Gather system identification info for admin display (OS, arch, IP)
+ * Gather system identification info for admin display (OS, arch, hostname, all host IPs)
+ * Returns sync-only fields; caller can merge docker/version_sha from async getters.
  */
 function getSystemInfo() {
-  const info = {
-    os_platform: platform(),
-    os_release: release(),
-    os_arch: arch()
-  };
+  const host_ips = [];
   try {
     const ifaces = networkInterfaces();
     for (const name of Object.keys(ifaces || {})) {
       for (const iface of ifaces[name] || []) {
-        if (iface.family === 'IPv4' && !iface.internal) {
-          info.ip = iface.address;
-          return info;
+        if (iface.family === 'IPv4' && !iface.internal && iface.address) {
+          host_ips.push(iface.address);
         }
       }
     }
   } catch (_) {
     // ignore
   }
-  return info;
+  // Keep single ip for backward compatibility; prefer first host IP
+  const ip = host_ips.length > 0 ? host_ips[0] : null;
+  return {
+    hostname: hostname(),
+    os_platform: platform(),
+    os_release: release(),
+    os_arch: arch(),
+    ip,
+    host_ips: host_ips.length > 0 ? host_ips : null
+  };
+}
+
+/**
+ * Get Docker daemon info for admin display (version, OS, etc.)
+ */
+async function getDockerDaemonInfo() {
+  try {
+    const info = await docker.info();
+    return {
+      server_version: info.ServerVersion || null,
+      operating_system: info.OperatingSystem || null,
+      architecture: info.Architecture || null,
+      driver: info.Driver || null,
+      name: info.Name || null
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Get helper image digest (SHA) - from env or by inspecting current container's image
+ */
+async function getHelperImageDigest() {
+  if (process.env.IMAGE_DIGEST || process.env.HELPER_IMAGE_SHA) {
+    const d = (process.env.IMAGE_DIGEST || process.env.HELPER_IMAGE_SHA).trim();
+    return d.startsWith('sha256:') ? d : `sha256:${d}`;
+  }
+  try {
+    const containers = await docker.listContainers({ all: true });
+    const selfName = hostname() || HELPER_CONTAINER_NAME;
+    const self = containers.find(c =>
+      (c.Names || []).some(n => n.includes(selfName) || n.includes(HELPER_CONTAINER_NAME))
+    );
+    if (!self) return null;
+    const imageRef = self.ImageID || self.Image;
+    if (!imageRef) return null;
+    const img = docker.getImage(imageRef);
+    const inspect = await img.inspect();
+    const digests = inspect.RepoDigests || [];
+    if (digests.length > 0) {
+      const d = digests[0];
+      return d.includes('@') ? d.split('@')[1] : d;
+    }
+    const id = inspect.Id;
+    return id ? (id.startsWith('sha256:') ? id : `sha256:${id}`) : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 /**
@@ -169,6 +223,10 @@ async function registerEngine() {
   while (retries > 0) {
     try {
       const system_info = getSystemInfo();
+      try {
+        system_info.docker = await getDockerDaemonInfo();
+      } catch (_) {}
+      const version_sha = await getHelperImageDigest();
       const response = await axios.post(
         `${BACKEND_URL}/api/docker-engines/register`,
         {
@@ -176,7 +234,9 @@ async function registerEngine() {
           hostname: hostname(),
           docker_socket: DOCKER_SOCKET,
           status: 'active',
-          system_info
+          system_info,
+          version_sha: version_sha || undefined,
+          image_url: HELPER_IMAGE
         },
         { headers: getAuthHeaders() }
       );
@@ -390,6 +450,10 @@ async function sendHeartbeat() {
       console.warn(`⚠️ Metrics collection failed:`, err.message);
     }
     const system_info = getSystemInfo();
+    try {
+      system_info.docker = await getDockerDaemonInfo();
+    } catch (_) {}
+    const version_sha = await getHelperImageDigest();
     await axios.post(
       `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/heartbeat`,
       {
@@ -398,7 +462,9 @@ async function sendHeartbeat() {
         metrics,
         version: HELPER_VERSION,
         build_date: HELPER_BUILD_DATE,
-        system_info
+        system_info,
+        version_sha: version_sha || undefined,
+        image_url: HELPER_IMAGE
       },
       { headers: getAuthHeaders(), timeout: 15000 }
     );
