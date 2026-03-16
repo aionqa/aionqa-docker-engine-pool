@@ -56,6 +56,47 @@ const LOG_CONFIG_JSON_FILE = {
 // Track running containers (containerId -> jobId)
 const runningContainers = new Map();
 
+/** Backend retry delays: 10s, 30s, 3min. Runners continue without interruption when backend restarts; only admin explicit cleanup clears state. */
+const BACKEND_RETRY_DELAYS_MS = [10 * 1000, 30 * 1000, 3 * 60 * 1000];
+const BACKEND_RETRY_ATTEMPTS = 1 + BACKEND_RETRY_DELAYS_MS.length; // 4 total
+
+function isRetryableBackendError(error) {
+  if (!error) return false;
+  const code = error.code || '';
+  const status = error.response?.status;
+  if (['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'ENOTFOUND', 'ENETUNREACH'].includes(code)) return true;
+  if (status >= 500 || status === 408) return true;
+  return false;
+}
+
+/**
+ * Run a backend request with retries: 10s, 30s, 3min. Log after all attempts if still failing.
+ * @param {() => Promise<T>} fn - Async function that performs the request (no args).
+ * @param {string} label - Label for logging (e.g. "poll", "heartbeat", "job/123/complete").
+ * @returns {Promise<T|null>} Resolved value or null if all attempts failed (caller can treat null as no-op where appropriate).
+ */
+async function withBackendRetry(fn, label) {
+  let lastError;
+  for (let attempt = 1; attempt <= BACKEND_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (!isRetryableBackendError(error) || attempt === BACKEND_RETRY_ATTEMPTS) {
+        break;
+      }
+      const delayMs = BACKEND_RETRY_DELAYS_MS[attempt - 1];
+      console.warn(`⚠️ [BACKEND-RETRY] ${label} attempt ${attempt}/${BACKEND_RETRY_ATTEMPTS} failed: ${error.message}. Retrying in ${delayMs / 1000}s...`);
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+  console.error(`❌ [BACKEND-RETRY] Request failed after ${BACKEND_RETRY_ATTEMPTS} attempts: ${label}: ${lastError?.message || lastError}`);
+  if (lastError?.response) {
+    console.error(`   Status: ${lastError.response.status}; Response:`, lastError.response.data);
+  }
+  throw lastError;
+}
+
 /**
  * Get axios headers with authentication
  */
@@ -454,7 +495,7 @@ async function sendHeartbeat() {
       system_info.docker = await getDockerDaemonInfo();
     } catch (_) {}
     const version_sha = await getHelperImageDigest();
-    await axios.post(
+    await withBackendRetry(() => axios.post(
       `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/heartbeat`,
       {
         status: 'active',
@@ -467,9 +508,9 @@ async function sendHeartbeat() {
         image_url: HELPER_IMAGE
       },
       { headers: getAuthHeaders(), timeout: 15000 }
-    );
+    ), 'heartbeat');
   } catch (error) {
-    console.error(`⚠️ Heartbeat failed:`, error.message);
+    // Logged by withBackendRetry; heartbeat is best-effort
   }
 }
 
@@ -478,14 +519,16 @@ async function sendHeartbeat() {
  */
 async function pollForJobs() {
   try {
-    console.log(`[POLL] Polling for jobs at ${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/jobs/next`);
-    const response = await axios.get(
-      `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/jobs/next`,
-      {
-        headers: getAuthHeaders(),
-        timeout: 10000
-      }
-    );
+    const response = await withBackendRetry(() => {
+      console.log(`[POLL] Polling for jobs at ${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/jobs/next`);
+      return axios.get(
+        `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/jobs/next`,
+        {
+          headers: getAuthHeaders(),
+          timeout: 10000
+        }
+      );
+    }, 'poll');
 
     console.log(`[POLL] Response status: ${response.status}`);
     console.log(`[POLL] Response data:`, JSON.stringify(response.data).substring(0, 500));
@@ -768,30 +811,30 @@ async function startCrawlerContainer(job) {
     // Monitor container
     monitorContainer(container, job_id);
 
-    // Notify backend that container started
-    await axios.post(
-      `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/jobs/${job_id}/started`,
-      {
-        container_id: container.id
-      },
-      { headers: getAuthHeaders() }
-    );
+    // Notify backend that container started (retry on backend unavailable)
+    try {
+      await withBackendRetry(() => axios.post(
+        `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/jobs/${job_id}/started`,
+        { container_id: container.id },
+        { headers: getAuthHeaders() }
+      ), `jobs/${job_id}/started`);
+    } catch (e) {
+      console.error(`⚠️ Failed to notify backend of container start for job ${job_id}:`, e?.message);
+    }
 
     return container.id;
   } catch (error) {
     console.error(`❌ Failed to start container for job ${job_id}:`, error.message);
     
-    // Notify backend of failure
+    // Notify backend of failure (retry on backend unavailable)
     try {
-      await axios.post(
+      await withBackendRetry(() => axios.post(
         `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/jobs/${job_id}/failed`,
-        {
-          error: error.message
-        },
+        { error: error.message },
         { headers: getAuthHeaders() }
-      );
+      ), `jobs/${job_id}/failed`);
     } catch (notifyError) {
-      console.error(`❌ Failed to notify backend of container failure:`, notifyError.message);
+      console.error(`❌ Failed to notify backend of container failure after retries:`, notifyError?.message);
     }
     
     throw error;
@@ -811,16 +854,13 @@ async function monitorContainer(container, jobId) {
     console.log(`📦 Container ${container.id.substring(0, 12)} exited with code ${exitCode} for job ${jobId}`);
 
     try {
-      await axios.post(
+      await withBackendRetry(() => axios.post(
         `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/jobs/${jobId}/completed`,
-        {
-          container_id: container.id,
-          exit_code: exitCode
-        },
+        { container_id: container.id, exit_code: exitCode },
         { headers: getAuthHeaders() }
-      );
+      ), `jobs/${jobId}/completed`);
     } catch (error) {
-      console.error(`⚠️ Failed to notify backend of container completion:`, error.message);
+      console.error(`⚠️ Failed to notify backend of container completion after retries:`, error?.message);
     }
 
     try {
