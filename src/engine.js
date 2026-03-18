@@ -15,10 +15,21 @@ const BACKEND_URL = process.env.BACKEND_URL || 'http://back:4000';
 const ENGINE_TOKEN = process.env.ENGINE_TOKEN; // Token for authenticating with backend
 const SERVICE_KEY = process.env.SERVICE_KEY; // Optional service key for image URL retrieval
 const ENGINE_ID = process.env.ENGINE_ID || `docker-engine-${hostname()}-${randomUUID().substring(0, 8)}`;
+/** Optional. If set, crawler containers are named aionqa-crawler-runner-{name} so the helper can replace existing container by name. */
+const RUNNER_NAME = process.env.RUNNER_NAME || null;
+/** For logging; backend runner_id comes from token. */
+const RUNNER_ID = process.env.RUNNER_ID || ENGINE_ID;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '5000'); // 5 seconds
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 // ECR repositories are public - no AWS credentials needed
 // Helper uses ENGINE_TOKEN (project credentials) for backend authentication only
+
+/** Sanitize runner name for Docker container name segment: [a-zA-Z0-9][a-zA-Z0-9_.-]* (max 50 chars). */
+function sanitizeRunnerName(name) {
+  if (!name || typeof name !== 'string') return 'default';
+  const s = name.trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+  return (s || 'default').slice(0, 50);
+}
 
 // Validate engine token (required for job polling)
 if (!ENGINE_TOKEN) {
@@ -31,6 +42,7 @@ if (!ENGINE_TOKEN) {
 // If not provided, image URL comes from job response
 
 console.log(`🐳 Docker Engine ID: ${ENGINE_ID}`);
+if (RUNNER_NAME) console.log(`🏷️  Runner name: ${RUNNER_NAME} (crawler container will be aionqa-crawler-runner-${sanitizeRunnerName(RUNNER_NAME)})`);
 console.log(`🔗 Backend URL: ${BACKEND_URL}`);
 console.log(`⏱️  Poll interval: ${POLL_INTERVAL}ms`);
 console.log(`🔌 Docker socket: ${DOCKER_SOCKET}`);
@@ -723,16 +735,17 @@ async function startCrawlerContainer(job) {
       ...Object.entries(environment_vars || {}).map(([key, value]) => `${key}=${value}`)
     ];
     
-    // Generate container name: aionqa-crawler-job-{jobId}
-    const containerName = `aionqa-crawler-job-${job_id}`;
+    // Container name: if RUNNER_NAME is set, use named runner slot (helper can replace existing by name); else per-job name.
+    const containerName = RUNNER_NAME
+      ? `aionqa-crawler-runner-${sanitizeRunnerName(RUNNER_NAME)}`
+      : `aionqa-crawler-job-${job_id}`;
 
-    // Customer isolation: never reuse a container. Always create a new one from the image
-    // so that no data or state from a previous job (possibly another customer) can leak.
+    // Replace existing container with same name if present (named runner: replace previous; per-job: clean stale).
     try {
       const existingContainer = docker.getContainer(containerName);
       const containerInfo = await existingContainer.inspect();
       if (containerInfo) {
-        console.log(`🧹 Cleaning up existing container: ${containerName} (always use fresh container for isolation)`);
+        console.log(`🧹 Replacing existing container: ${containerName}`);
         try {
           await existingContainer.stop();
         } catch (stopError) {

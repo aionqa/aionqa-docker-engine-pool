@@ -19,6 +19,7 @@ This service allows you to run crawling jobs on remote Docker engines instead of
 - `BACKEND_URL` - Backend API URL (default: `http://back:4000`)
 - `ENGINE_TOKEN` - Authentication token (required, generate in UI)
 - `ENGINE_ID` - Unique engine identifier (auto-generated if not provided)
+- `RUNNER_NAME` - Optional. If set, crawler containers are named `aionqa-crawler-runner-{name}` (sanitized) so the helper can start a container with a specific name and replace any existing one. Useful for one-runner-per-slot setups.
 - `POLL_INTERVAL` - Poll interval in milliseconds (default: 5000)
 - `DOCKER_SOCKET` - Docker socket path (default: `/var/run/docker.sock`)
 
