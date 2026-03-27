@@ -20,6 +20,7 @@ const RUNNER_NAME = process.env.RUNNER_NAME || null;
 /** For logging; backend runner_id comes from token. */
 const RUNNER_ID = process.env.RUNNER_ID || ENGINE_ID;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '5000'); // 5 seconds
+const IMAGE_CHECK_INTERVAL_MS = parseInt(process.env.IMAGE_CHECK_INTERVAL_MS || '300000'); // 5 minutes
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 // ECR repositories are public - no AWS credentials needed
 // Helper uses ENGINE_TOKEN (project credentials) for backend authentication only
@@ -67,6 +68,19 @@ const LOG_CONFIG_JSON_FILE = {
 
 // Track running containers (containerId -> jobId)
 const runningContainers = new Map();
+let helperRestartPendingFromImageUpdate = false;
+let helperPendingImageUrl = null;
+
+function normalizeSha(value) {
+  return String(value || '').trim().replace(/^sha256:/, '').toLowerCase();
+}
+
+function imageIdMatchesSha(imageId, expectedSha) {
+  const idNorm = normalizeSha(imageId);
+  const shaNorm = normalizeSha(expectedSha);
+  if (!idNorm || !shaNorm) return false;
+  return idNorm === shaNorm || idNorm.startsWith(shaNorm) || shaNorm.startsWith(idNorm);
+}
 
 /** Backend retry delays: 10s, 30s, 3min. Runners continue without interruption when backend restarts; only admin explicit cleanup clears state. */
 const BACKEND_RETRY_DELAYS_MS = [10 * 1000, 30 * 1000, 3 * 60 * 1000];
@@ -952,13 +966,11 @@ async function updateHelperImage() {
           if (!img.RepoTags) return false;
           const matchesTag = img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
           if (!matchesTag) return false;
-          const idNorm = (img.Id || '').replace(/^sha256:/, '');
-          const shaNorm = (imageSha || '').replace(/^sha256:/, '');
-          return idNorm === shaNorm || (idNorm && shaNorm && (idNorm.startsWith(shaNorm) || shaNorm.startsWith(idNorm)));
+          return imageIdMatchesSha(img.Id, imageSha);
         });
         if (localImage) {
           console.log(`✅ Helper image is up to date (SHA matches)`);
-          return { safeToRestart: true, imageUrl };
+          return { safeToRestart: true, imageUrl, updated: false };
         }
       } catch (checkError) {
         console.error(`❌ Error comparing SHA: ${checkError.message}; skipping SHA check, will pull`);
@@ -979,10 +991,10 @@ async function updateHelperImage() {
       });
     });
     console.log(`✅ Helper image updated successfully`);
-    return { safeToRestart: true, imageUrl };
+    return { safeToRestart: true, imageUrl, updated: true };
   } catch (error) {
     console.warn(`⚠️ Failed to update helper image: ${error.message}`);
-    return { safeToRestart: false, reason: error.message };
+    return { safeToRestart: false, reason: error.message, updated: false };
   }
 }
 
@@ -1022,12 +1034,12 @@ async function checkCrawlerImage() {
           const matchesTag = img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
           if (!matchesTag) return false;
           // Check if SHA matches
-          return img.Id === imageSha || img.Id.startsWith(imageSha.replace('sha256:', ''));
+          return imageIdMatchesSha(img.Id, imageSha);
         });
         
         if (localImage) {
           console.log(`✅ Crawler image is up to date (SHA matches)`);
-          return; // Already up to date
+          return false; // Already up to date
         }
       } catch (checkError) {
         console.warn(`⚠️ Could not check local crawler image: ${checkError.message}, will pull`);
@@ -1039,7 +1051,7 @@ async function checkCrawlerImage() {
     const tokenData = await getECRPullToken(imageUrl);
     if (!tokenData) {
       console.warn(`⚠️ Failed to get ECR token for crawler image`);
-      return;
+      return false;
     }
     
     const authConfig = getECRAuthConfig(tokenData);
@@ -1061,9 +1073,82 @@ async function checkCrawlerImage() {
         });
       });
     });
+    return true;
   } catch (error) {
     console.warn(`⚠️ Failed to check crawler image: ${error.message}`);
     // Don't fail if crawler image check fails
+    return false;
+  }
+}
+
+async function checkAIServiceImageAndRestartIfUpdated() {
+  try {
+    if (!isAIServiceEnabled()) return false;
+    const containerName = getAIServiceContainerName();
+    const response = await axios.post(
+      `${BACKEND_URL}/api/docker-engines/image-url`,
+      { image_name: 'aionqa-ai-service:latest' },
+      { headers: getAuthHeaders(), timeout: 10000 }
+    );
+    const imageUrl = response.data?.image_url;
+    const imageSha = response.data?.image_sha || null;
+    if (!imageUrl || !imageSha) {
+      // Without SHA we cannot safely detect updates without forced pull/restart loops.
+      return false;
+    }
+
+    const containers = await docker.listContainers({ all: true });
+    const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === containerName));
+    if (existing && imageIdMatchesSha(existing.ImageID || existing.Image, imageSha)) {
+      return false;
+    }
+
+    console.log(`🔄 AI service image update detected (${containerName}); pulling and restarting...`);
+    await pullAIServiceImage(true);
+    await stopAndRemoveAIServiceContainer();
+    await startAIServiceContainer();
+    return true;
+  } catch (error) {
+    console.warn(`⚠️ Failed AI service auto-update check: ${error.message}`);
+    return false;
+  }
+}
+
+async function runAutomaticImageReconcile() {
+  try {
+    const crawlerUpdated = await checkCrawlerImage();
+    if (crawlerUpdated) {
+      console.log(`✅ [AUTO-IMAGE] Crawler image updated (new jobs will use latest image).`);
+    }
+
+    const aiUpdated = await checkAIServiceImageAndRestartIfUpdated();
+    if (aiUpdated) {
+      console.log(`✅ [AUTO-IMAGE] AI service image updated and container restarted.`);
+    }
+
+    const helperResult = await updateHelperImage();
+    if (helperResult?.updated) {
+      const hasActiveWork = runningContainers.size > 0 || processingJobs.size > 0;
+      if (hasActiveWork) {
+        helperRestartPendingFromImageUpdate = true;
+        helperPendingImageUrl = helperResult.imageUrl || null;
+        console.log(`⏸️ [AUTO-IMAGE] Helper image updated but restart deferred (active jobs=${runningContainers.size}, processing=${processingJobs.size}).`);
+      } else if (helperResult.imageUrl) {
+        console.log(`🔄 [AUTO-IMAGE] Helper image updated; restarting helper container now.`);
+        await recreateViaDockerApi(helperResult.imageUrl);
+      }
+    } else if (helperRestartPendingFromImageUpdate) {
+      const hasActiveWork = runningContainers.size > 0 || processingJobs.size > 0;
+      if (!hasActiveWork && helperPendingImageUrl) {
+        console.log(`🔄 [AUTO-IMAGE] Executing deferred helper restart after image update.`);
+        helperRestartPendingFromImageUpdate = false;
+        const imageUrl = helperPendingImageUrl;
+        helperPendingImageUrl = null;
+        await recreateViaDockerApi(imageUrl);
+      }
+    }
+  } catch (error) {
+    console.warn(`⚠️ [AUTO-IMAGE] Automatic image reconcile failed: ${error.message}`);
   }
 }
 
@@ -2000,7 +2085,13 @@ async function main() {
   setInterval(cleanupContainers, 30 * 1000);
   await cleanupContainers();
 
-  // No periodic image check: update images only when explicitly told (restart_requested, pending "update" actions) or when starting a container that needs one.
+  // Automatic image reconciliation: helper controls image lifecycle and restarts affected services.
+  setInterval(() => {
+    runAutomaticImageReconcile().catch(() => {});
+  }, IMAGE_CHECK_INTERVAL_MS);
+  setTimeout(() => {
+    runAutomaticImageReconcile().catch(() => {});
+  }, 15000);
 
   // Main polling loop
   let pollCount = 0;
