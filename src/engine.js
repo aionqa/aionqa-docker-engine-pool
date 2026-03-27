@@ -82,6 +82,21 @@ function imageIdMatchesSha(imageId, expectedSha) {
   return idNorm === shaNorm || idNorm.startsWith(shaNorm) || shaNorm.startsWith(idNorm);
 }
 
+function normalizeContainerName(name) {
+  return String(name || '').replace(/^\//, '').trim();
+}
+
+function findContainerByName(containers, requestedName) {
+  const target = normalizeContainerName(requestedName).toLowerCase();
+  if (!target) return null;
+  return containers.find(c =>
+    (c.Names || []).some(n => {
+      const normalized = normalizeContainerName(n).toLowerCase();
+      return normalized === target || normalized.includes(target);
+    })
+  ) || null;
+}
+
 /** Backend retry delays: 10s, 30s, 3min. Runners continue without interruption when backend restarts; only admin explicit cleanup clears state. */
 const BACKEND_RETRY_DELAYS_MS = [10 * 1000, 30 * 1000, 3 * 60 * 1000];
 const BACKEND_RETRY_ATTEMPTS = 1 + BACKEND_RETRY_DELAYS_MS.length; // 4 total
@@ -1114,6 +1129,120 @@ async function checkAIServiceImageAndRestartIfUpdated() {
   }
 }
 
+function getCureServiceContainerName() {
+  const envName = process.env.CURE_CONTAINER_NAME;
+  if (envName && typeof envName === 'string' && envName.trim()) return envName.trim();
+  const cfgName = helperConfig?.cure_container_name;
+  if (cfgName && typeof cfgName === 'string' && cfgName.trim()) return cfgName.trim();
+  return 'aionqa-cure';
+}
+
+function isCureServiceEnabled() {
+  if (process.env.CURE_SERVICE_ENABLED === 'true' || process.env.CURE_SERVICE_ENABLED === '1') return true;
+  if (process.env.CURE_SERVICE_ENABLED === 'false' || process.env.CURE_SERVICE_ENABLED === '0') return false;
+  if (typeof helperConfig?.cure_service_enabled === 'boolean') return helperConfig.cure_service_enabled;
+  // If not explicitly configured, treat existing container as enabled.
+  return true;
+}
+
+async function getCureImageUrl() {
+  if (!isCureServiceEnabled()) return null;
+  const imageUrlFromEnv = process.env.CURE_IMAGE_URL;
+  if (imageUrlFromEnv) return imageUrlFromEnv;
+  try {
+    const response = await axios.post(
+      `${BACKEND_URL}/api/docker-engines/image-url`,
+      { image_name: 'aionqa-cure:latest' },
+      { headers: getAuthHeaders(), timeout: 10000 }
+    );
+    if (response.data?.image_url) return response.data.image_url;
+  } catch (error) {
+    console.warn(`⚠️ Failed to get cure image URL from backend: ${error.message}`);
+  }
+  const region = process.env.AWS_REGION || 'ap-southeast-2';
+  const accountId = process.env.AWS_ACCOUNT_ID || '778954507986';
+  return `${accountId}.dkr.ecr.${region}.amazonaws.com/aionqa-cure:latest`;
+}
+
+async function pullManagedImage(imageUrl, forcePull = false, label = 'service') {
+  if (!imageUrl) return false;
+  try {
+    if (!forcePull) {
+      const images = await docker.listImages();
+      const localImage = images.find(img => {
+        if (!img.RepoTags) return false;
+        return img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
+      });
+      if (localImage) return true;
+    }
+    const tokenData = await getECRPullToken(imageUrl);
+    if (!tokenData) {
+      console.warn(`⚠️ Failed to get ECR token for ${label} image`);
+      return false;
+    }
+    const authConfig = getECRAuthConfig(tokenData);
+    await new Promise((resolve, reject) => {
+      docker.pull(imageUrl, { authconfig: authConfig }, (err, stream) => {
+        if (err) return reject(err);
+        docker.modem.followProgress(stream, (progressErr) => (progressErr ? reject(progressErr) : resolve()));
+      });
+    });
+    return true;
+  } catch (error) {
+    console.warn(`⚠️ Failed to pull ${label} image: ${error.message}`);
+    return false;
+  }
+}
+
+async function recreateContainerFromExisting(existingId, newImageUrl, containerName, label = 'service') {
+  if (!existingId || !newImageUrl || !containerName) return false;
+  try {
+    const oldContainer = docker.getContainer(existingId);
+    const inspectData = await oldContainer.inspect();
+    const createOpts = buildCreateOptsFromInspect(inspectData, newImageUrl, containerName);
+    if (inspectData?.State?.Running) {
+      await oldContainer.stop({ t: 10 }).catch(() => {});
+    }
+    await oldContainer.remove({ force: true }).catch(() => {});
+    const newContainer = await docker.createContainer(createOpts);
+    await newContainer.start();
+    console.log(`✅ ${label} container redeployed: ${containerName}`);
+    return true;
+  } catch (error) {
+    console.warn(`⚠️ Failed to redeploy ${label} container ${containerName}: ${error.message}`);
+    return false;
+  }
+}
+
+async function checkCureServiceImageAndRestartIfUpdated() {
+  try {
+    if (!isCureServiceEnabled()) return false;
+    const containerName = getCureServiceContainerName();
+    const containers = await docker.listContainers({ all: true });
+    const existing = findContainerByName(containers, containerName);
+    if (!existing) return false;
+
+    const response = await axios.post(
+      `${BACKEND_URL}/api/docker-engines/image-url`,
+      { image_name: 'aionqa-cure:latest' },
+      { headers: getAuthHeaders(), timeout: 10000 }
+    );
+    const imageUrl = response.data?.image_url;
+    const imageSha = response.data?.image_sha || null;
+    if (!imageUrl) return false;
+    if (imageSha && imageIdMatchesSha(existing.ImageID || existing.Image, imageSha)) return false;
+
+    console.log(`🔄 Cure image update detected (${containerName}); pulling and redeploying...`);
+    const pulled = await pullManagedImage(imageUrl, true, 'cure');
+    if (!pulled) return false;
+    const targetName = normalizeContainerName(existing.Names?.[0]) || containerName;
+    return await recreateContainerFromExisting(existing.Id, imageUrl, targetName, 'cure');
+  } catch (error) {
+    console.warn(`⚠️ Failed cure service auto-update check: ${error.message}`);
+    return false;
+  }
+}
+
 async function runAutomaticImageReconcile() {
   try {
     const crawlerUpdated = await checkCrawlerImage();
@@ -1124,6 +1253,11 @@ async function runAutomaticImageReconcile() {
     const aiUpdated = await checkAIServiceImageAndRestartIfUpdated();
     if (aiUpdated) {
       console.log(`✅ [AUTO-IMAGE] AI service image updated and container restarted.`);
+    }
+
+    const cureUpdated = await checkCureServiceImageAndRestartIfUpdated();
+    if (cureUpdated) {
+      console.log(`✅ [AUTO-IMAGE] Cure image updated and container redeployed.`);
     }
 
     const helperResult = await updateHelperImage();
@@ -1160,7 +1294,8 @@ async function checkAllImages(skipHelper = false) {
   const tasks = [
     ...(skipHelper ? [] : [updateHelperImage()]),
     pullAIServiceImage(),
-    checkCrawlerImage()
+    checkCrawlerImage(),
+    checkCureServiceImageAndRestartIfUpdated()
   ];
   await Promise.allSettled(tasks);
   console.log(`✅ Image check complete`);
@@ -1835,7 +1970,7 @@ async function runPendingContainerActions() {
       }
     }
     // Deduplicate: execute each (action, container) once
-    const key = (a, name) => `${a}:${(name || '').replace(/^\//, '').toLowerCase()}`;
+    const key = (a, name) => `${a}:${normalizeContainerName(name).toLowerCase()}`;
     const byKey = new Map();
     for (const p of pending) {
       const k = key(p.action, p.container_name);
@@ -1847,12 +1982,10 @@ async function runPendingContainerActions() {
     console.log(`[CONTAINER-ACTIONS] Executing ${toRun.length} unique action(s):`, toRun.map(p => ({ action: p.action, container: p.container_name })));
     let selfUpdateRequested = false;
     for (const { action, container_name: name } of toRun) {
-      const normalizedName = (name || '').replace(/^\//, '').toLowerCase();
+      const normalizedName = normalizeContainerName(name).toLowerCase();
       try {
         const containers = await docker.listContainers({ all: true });
-        const found = containers.find(c =>
-          (c.Names || []).some(n => n.replace(/^\//, '').toLowerCase() === normalizedName || n.replace(/^\//, '').toLowerCase().includes(normalizedName))
-        );
+        const found = findContainerByName(containers, normalizedName);
         if (action === 'stop') {
           if (found) {
             const container = docker.getContainer(found.Id);
@@ -1901,6 +2034,22 @@ async function runPendingContainerActions() {
               await pullAIServiceImage(true);
               await startAIServiceContainer(true);
               console.log(`🔄 Updated AI service`);
+            }
+          } else if (normalizedName.includes('aionqa-cure') || normalizedName === getCureServiceContainerName().toLowerCase()) {
+            if (!found) {
+              console.log(`⏭️ Skipping cure update: container not found (${name})`);
+            } else {
+              const imageUrl = await getCureImageUrl();
+              if (!imageUrl) {
+                console.warn(`⚠️ Cure update skipped: no image URL`);
+              } else {
+                const pulled = await pullManagedImage(imageUrl, true, 'cure');
+                if (pulled) {
+                  const targetName = normalizeContainerName(found.Names?.[0]) || getCureServiceContainerName();
+                  const updated = await recreateContainerFromExisting(found.Id, imageUrl, targetName, 'cure');
+                  if (updated) console.log(`🔄 Updated cure service`);
+                }
+              }
             }
           } else if (found) {
             const container = docker.getContainer(found.Id);
