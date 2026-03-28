@@ -1270,6 +1270,7 @@ function getCureServiceEnv() {
     `CURE_TOKEN=${runnerToken}`,
     `SERVICE_TOKEN=${process.env.SERVICE_TOKEN || ''}`,
     `CURE_AGENT_ID=${process.env.CURE_AGENT_ID || `${ENGINE_ID}-cure`}`,
+    `CURE_ENGINE_ID=${ENGINE_ID}`,
     `CURSOR_WORKSPACE_ROOT=${process.env.CURE_WORKSPACE_ROOT || '/app'}`,
     `CURSOR_AGENT_COMMAND=${process.env.CURE_AGENT_COMMAND || ''}`,
     `POLL_INTERVAL_MS=${process.env.CURE_POLL_INTERVAL_MS || '10000'}`,
