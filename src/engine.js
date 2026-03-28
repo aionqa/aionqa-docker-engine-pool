@@ -1246,13 +1246,14 @@ async function checkCureServiceImageAndRestartIfUpdated() {
 function getCureServiceEnv() {
   const backendUrl = process.env.CURE_BACKEND_URL || process.env.BACKEND_URL || 'https://admin-api.aionqa.com';
   const backendKind = process.env.CURE_BACKEND_KIND || 'admin';
-  const authMode = process.env.CURE_AUTH_MODE || 'admin';
+  const authMode = process.env.CURE_AUTH_MODE || 'runner';
+  const runnerToken = process.env.CURE_TOKEN || process.env.ENGINE_TOKEN || '';
   return [
     `BACKEND_URL=${backendUrl}`,
     `CURE_BACKEND_KIND=${backendKind}`,
     `CURE_AUTH_MODE=${authMode}`,
     `ADMIN_TOKEN=${process.env.ADMIN_TOKEN || ''}`,
-    `CURE_TOKEN=${process.env.CURE_TOKEN || ''}`,
+    `CURE_TOKEN=${runnerToken}`,
     `SERVICE_TOKEN=${process.env.SERVICE_TOKEN || ''}`,
     `CURE_AGENT_ID=${process.env.CURE_AGENT_ID || `${ENGINE_ID}-cure`}`,
     `CURSOR_WORKSPACE_ROOT=${process.env.CURE_WORKSPACE_ROOT || '/workspace'}`,
