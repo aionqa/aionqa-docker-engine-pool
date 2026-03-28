@@ -1243,6 +1243,91 @@ async function checkCureServiceImageAndRestartIfUpdated() {
   }
 }
 
+function getCureServiceEnv() {
+  const backendUrl = process.env.CURE_BACKEND_URL || process.env.BACKEND_URL || 'https://admin-api.aionqa.com';
+  const backendKind = process.env.CURE_BACKEND_KIND || 'admin';
+  const authMode = process.env.CURE_AUTH_MODE || 'admin';
+  return [
+    `BACKEND_URL=${backendUrl}`,
+    `CURE_BACKEND_KIND=${backendKind}`,
+    `CURE_AUTH_MODE=${authMode}`,
+    `ADMIN_TOKEN=${process.env.ADMIN_TOKEN || ''}`,
+    `CURE_TOKEN=${process.env.CURE_TOKEN || ''}`,
+    `SERVICE_TOKEN=${process.env.SERVICE_TOKEN || ''}`,
+    `CURE_AGENT_ID=${process.env.CURE_AGENT_ID || `${ENGINE_ID}-cure`}`,
+    `CURSOR_WORKSPACE_ROOT=${process.env.CURE_WORKSPACE_ROOT || '/workspace'}`,
+    `CURSOR_AGENT_COMMAND=${process.env.CURE_AGENT_COMMAND || ''}`,
+    `POLL_INTERVAL_MS=${process.env.CURE_POLL_INTERVAL_MS || '10000'}`,
+    `CURE_EXEC_TIMEOUT_MS=${process.env.CURE_EXEC_TIMEOUT_MS || '2700000'}`,
+    `CURE_RUNTIME_CONFIG_REFRESH_MS=${process.env.CURE_RUNTIME_CONFIG_REFRESH_MS || '300000'}`,
+    `CURE_HTTP_RETRY_MAX_ATTEMPTS=${process.env.CURE_HTTP_RETRY_MAX_ATTEMPTS || '4'}`,
+    `CURE_HTTP_RETRY_BASE_MS=${process.env.CURE_HTTP_RETRY_BASE_MS || '1000'}`,
+  ];
+}
+
+async function stopAndRemoveCureServiceContainer() {
+  const containerName = getCureServiceContainerName();
+  try {
+    const containers = await docker.listContainers({ all: true });
+    const existing = findContainerByName(containers, containerName);
+    if (!existing) return;
+    const container = docker.getContainer(existing.Id);
+    if (existing.State === 'running') {
+      await container.stop({ t: 10 }).catch(() => {});
+    }
+    await container.remove({ force: true }).catch(() => {});
+    console.log(`✅ Cure service container stopped/removed: ${containerName}`);
+  } catch (error) {
+    console.warn(`⚠️ Failed to stop/remove cure service container: ${error.message}`);
+  }
+}
+
+async function startCureServiceContainer(useCachedConfig = false) {
+  if (!useCachedConfig) await fetchHelperConfig();
+  if (!isCureServiceEnabled()) return false;
+
+  const containerName = getCureServiceContainerName();
+  const imageUrl = await getCureImageUrl();
+  if (!imageUrl) return false;
+
+  try {
+    const containers = await docker.listContainers({ all: true });
+    const existing = findContainerByName(containers, containerName);
+    if (existing && existing.State === 'running') return true;
+    if (existing) {
+      const oldContainer = docker.getContainer(existing.Id);
+      await oldContainer.stop({ t: 10 }).catch(() => {});
+      await oldContainer.remove({ force: true }).catch(() => {});
+    }
+
+    const pulled = await pullManagedImage(imageUrl, true, 'cure');
+    if (!pulled) return false;
+
+    const hostConfig = {
+      NetworkMode: getConfigNetwork(),
+      RestartPolicy: { Name: 'unless-stopped' },
+      LogConfig: LOG_CONFIG_JSON_FILE,
+    };
+    const workspaceBind = process.env.CURE_WORKSPACE_BIND;
+    if (workspaceBind && workspaceBind.includes(':')) {
+      hostConfig.Binds = [workspaceBind];
+    }
+
+    const container = await docker.createContainer({
+      Image: imageUrl,
+      name: containerName,
+      Env: getCureServiceEnv(),
+      HostConfig: hostConfig,
+    });
+    await container.start();
+    console.log(`✅ Cure service container started: ${containerName} using ${imageUrl}`);
+    return true;
+  } catch (error) {
+    console.warn(`⚠️ Failed to start cure service container: ${error.message}`);
+    return false;
+  }
+}
+
 async function runAutomaticImageReconcile() {
   try {
     const crawlerUpdated = await checkCrawlerImage();
@@ -1631,6 +1716,11 @@ async function reconcileServices() {
     } else {
       await stopAndRemoveAIServiceContainer();
     }
+    if (isCureServiceEnabled()) {
+      await startCureServiceContainer(true); // config already fetched above
+    } else {
+      await stopAndRemoveCureServiceContainer();
+    }
   } catch (error) {
     console.warn(`⚠️ Reconcile services failed: ${error.message}`);
   }
@@ -2013,6 +2103,14 @@ async function runPendingContainerActions() {
             if (normalizedName === getAIServiceContainerName().toLowerCase() || normalizedName.includes('aionqa-ai-service')) {
               await startAIServiceContainer();
               console.log(`▶️ Started AI service`);
+            }
+          } else if (normalizedName.includes('aionqa-cure') || normalizedName === getCureServiceContainerName().toLowerCase()) {
+            await fetchHelperConfig();
+            const started = await startCureServiceContainer(true);
+            if (started) {
+              console.log(`▶️ Started cure service`);
+            } else {
+              console.log(`⏭️ Cure start skipped or failed`);
             }
           } else if (found) {
             const container = docker.getContainer(found.Id);
