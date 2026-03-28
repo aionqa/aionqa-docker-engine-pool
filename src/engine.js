@@ -1244,7 +1244,11 @@ async function checkCureServiceImageAndRestartIfUpdated() {
 }
 
 function getCureServiceEnv() {
-  const backendUrl = process.env.CURE_BACKEND_URL || process.env.BACKEND_URL || 'https://admin-api.aionqa.com';
+  const configuredCureBackendUrl = process.env.CURE_BACKEND_URL;
+  const defaultBackendUrl = process.env.BACKEND_URL || '';
+  const backendUrl = configuredCureBackendUrl
+    || (defaultBackendUrl.includes('://api.') ? defaultBackendUrl.replace('://api.', '://admin-api.') : defaultBackendUrl)
+    || 'https://admin-api.aionqa.com';
   const backendKind = process.env.CURE_BACKEND_KIND || 'admin';
   const authMode = process.env.CURE_AUTH_MODE || 'runner';
   const runnerToken = process.env.CURE_TOKEN || process.env.ENGINE_TOKEN || '';
