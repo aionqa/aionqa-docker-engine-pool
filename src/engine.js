@@ -82,6 +82,22 @@ function imageIdMatchesSha(imageId, expectedSha) {
   return idNorm === shaNorm || idNorm.startsWith(shaNorm) || shaNorm.startsWith(idNorm);
 }
 
+async function localImageDigestMatchesSha(imageRef, expectedSha) {
+  const shaNorm = normalizeSha(expectedSha);
+  if (!imageRef || !shaNorm) return false;
+  try {
+    const image = docker.getImage(imageRef);
+    const info = await image.inspect();
+    const repoDigests = Array.isArray(info?.RepoDigests) ? info.RepoDigests : [];
+    return repoDigests.some((digestRef) => {
+      const digest = String(digestRef || '').split('@').pop();
+      return normalizeSha(digest) === shaNorm;
+    });
+  } catch {
+    return false;
+  }
+}
+
 function normalizeContainerName(name) {
   return String(name || '').replace(/^\//, '').trim();
 }
@@ -976,14 +992,8 @@ async function updateHelperImage() {
     if (imageSha) {
       console.log(`📦 Helper image SHA: ${imageSha.substring(0, 12)}...`);
       try {
-        const images = await docker.listImages();
-        const localImage = images.find(img => {
-          if (!img.RepoTags) return false;
-          const matchesTag = img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
-          if (!matchesTag) return false;
-          return imageIdMatchesSha(img.Id, imageSha);
-        });
-        if (localImage) {
+        const isCurrent = await localImageDigestMatchesSha(imageUrl, imageSha);
+        if (isCurrent) {
           console.log(`✅ Helper image is up to date (SHA matches)`);
           return { safeToRestart: true, imageUrl, updated: false };
         }
@@ -1043,16 +1053,8 @@ async function checkCrawlerImage() {
     // Check if we need to update by comparing SHA
     if (imageSha) {
       try {
-        const images = await docker.listImages();
-        const localImage = images.find(img => {
-          if (!img.RepoTags) return false;
-          const matchesTag = img.RepoTags.some(tag => tag === imageUrl || tag.startsWith(imageUrl.split(':')[0] + ':'));
-          if (!matchesTag) return false;
-          // Check if SHA matches
-          return imageIdMatchesSha(img.Id, imageSha);
-        });
-        
-        if (localImage) {
+        const isCurrent = await localImageDigestMatchesSha(imageUrl, imageSha);
+        if (isCurrent) {
           console.log(`✅ Crawler image is up to date (SHA matches)`);
           return false; // Already up to date
         }
@@ -1114,7 +1116,7 @@ async function checkAIServiceImageAndRestartIfUpdated() {
 
     const containers = await docker.listContainers({ all: true });
     const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === containerName));
-    if (existing && imageIdMatchesSha(existing.ImageID || existing.Image, imageSha)) {
+    if (existing && await localImageDigestMatchesSha(imageUrl, imageSha)) {
       return false;
     }
 
@@ -1230,7 +1232,7 @@ async function checkCureServiceImageAndRestartIfUpdated() {
     const imageUrl = response.data?.image_url;
     const imageSha = response.data?.image_sha || null;
     if (!imageUrl) return false;
-    if (imageSha && imageIdMatchesSha(existing.ImageID || existing.Image, imageSha)) return false;
+    if (imageSha && await localImageDigestMatchesSha(imageUrl, imageSha)) return false;
 
     console.log(`🔄 Cure image update detected (${containerName}); pulling and redeploying...`);
     const pulled = await pullManagedImage(imageUrl, true, 'cure');
