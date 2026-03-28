@@ -1235,6 +1235,10 @@ async function checkCureServiceImageAndRestartIfUpdated() {
     const imageUrl = response.data?.image_url;
     const imageSha = response.data?.image_sha || null;
     if (!imageUrl) return false;
+    if (!imageSha) {
+      // Avoid restart churn when backend does not provide digest for cure image.
+      return false;
+    }
     if (imageSha && await localImageDigestMatchesSha(imageUrl, imageSha)) return false;
 
     console.log(`🔄 Cure image update detected (${containerName}); pulling and redeploying...`);
