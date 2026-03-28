@@ -1001,7 +1001,10 @@ async function updateHelperImage() {
         console.error(`❌ Error comparing SHA: ${checkError.message}; skipping SHA check, will pull`);
       }
     } else {
-      console.warn(`⚠️ Backend did not return image_sha; pulling image to update (no skip-if-current check)`);
+      // Never self-restart helper without a digest match signal.
+      // Missing SHA from backend previously caused perpetual self-update loops.
+      console.warn(`⚠️ Backend did not return image_sha; skipping helper self-update to avoid restart loops`);
+      return { safeToRestart: true, imageUrl, updated: false };
     }
     const tokenData = await getECRPullToken(imageUrl);
     if (!tokenData) {
