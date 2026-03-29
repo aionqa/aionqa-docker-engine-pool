@@ -2058,6 +2058,17 @@ function getOwnContainerId() {
   return null;
 }
 
+/** Compare Docker container IDs from inspect / cgroups / list (12- or 64-char). */
+function sameDockerContainerId(a, b) {
+  const key = (id) => String(id || '').replace(/^sha256:/i, '').toLowerCase().replace(/^docker-/, '');
+  const ka = key(a);
+  const kb = key(b);
+  if (!ka || !kb) return false;
+  const pa = ka.length >= 12 ? ka.slice(0, 12) : ka;
+  const pb = kb.length >= 12 ? kb.slice(0, 12) : kb;
+  return pa === pb;
+}
+
 /**
  * If this process is the new container after a self-update, take over the original name:
  * stop and remove the old container, then rename this container to the original name.
@@ -2068,7 +2079,7 @@ async function runSelfUpdateTakeoverIfNeeded() {
   const originalName = process.env.ORIGINAL_HELPER_NAME;
   if (!oldId || !originalName) return;
   const myId = getOwnContainerId();
-  if (!myId || myId === oldId) return;
+  if (!myId || sameDockerContainerId(myId, oldId)) return;
   try {
     console.log(`🔄 [SELF-UPDATE] Taking over: stopping and removing old container ${oldId}, then renaming to ${originalName}.`);
     const oldContainer = docker.getContainer(oldId);
@@ -2081,6 +2092,43 @@ async function runSelfUpdateTakeoverIfNeeded() {
     console.log(`✅ [SELF-UPDATE] Replaced old container; this container is now ${originalName}.`);
   } catch (err) {
     console.warn(`⚠️ [SELF-UPDATE] Takeover failed: ${err.message}. Continuing with current name.`);
+  }
+}
+
+/**
+ * Remove leftover containers from a failed or partial helper self-update (name pattern: {canonical}-new-{suffix}).
+ * Safe to run at startup after takeover; keeps the current container only.
+ */
+async function removeOrphanedHelperSelfUpdateContainers() {
+  const cid = getOwnContainerId();
+  if (!cid) return;
+  try {
+    const data = await docker.getContainer(cid).inspect();
+    const myName = normalizeContainerName(data.Name);
+    let canonical = process.env.ORIGINAL_HELPER_NAME
+      ? normalizeContainerName(process.env.ORIGINAL_HELPER_NAME)
+      : null;
+    if (!canonical) {
+      const m = myName.match(/^(.*)-new-[a-z0-9]+$/i);
+      canonical = m ? m[1] : myName;
+    }
+    if (!canonical) return;
+    const escaped = canonical.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`^${escaped}-new-[a-z0-9]+$`, 'i');
+    const list = await docker.listContainers({ all: true });
+    for (const c of list) {
+      if (sameDockerContainerId(c.Id, cid)) continue;
+      const names = (c.Names || []).map(normalizeContainerName);
+      if (!names.some((n) => re.test(n))) continue;
+      console.log(`🧹 [SELF-UPDATE] Removing stale helper swap container ${String(c.Id).slice(0, 12)} (${names.join(', ')})`);
+      const cont = docker.getContainer(c.Id);
+      await cont.stop({ t: 8 }).catch(() => {});
+      await cont.remove({ force: true }).catch((e) => {
+        console.warn(`⚠️ [SELF-UPDATE] Could not remove stale ${String(c.Id).slice(0, 12)}: ${e.message}`);
+      });
+    }
+  } catch (e) {
+    console.warn(`⚠️ [SELF-UPDATE] Stale swap container cleanup: ${e.message}`);
   }
 }
 
@@ -2151,6 +2199,17 @@ async function recreateViaDockerApi(newImageUrl) {
     console.log(`🔄 [SELF-UPDATE] Creating new container from ${newImageUrl} (same params as current), temp name ${newName}...`);
     const newContainer = await docker.createContainer(createOpts);
     await newContainer.start();
+    // Critical: compose/Kubernetes often use restart=unless-stopped. Exiting this process would otherwise
+    // stop the old container and Docker would immediately respawn it → two helpers (old + new temp name).
+    try {
+      await container.update({ RestartPolicy: { Name: 'no', MaximumRetryCount: 0 } });
+      console.log(`🔄 [SELF-UPDATE] Disabled auto-restart on previous container so the daemon will not respawn it after exit.`);
+    } catch (polErr) {
+      console.warn(
+        `⚠️ [SELF-UPDATE] Could not set restart policy to "no" on previous container: ${polErr.message}. ` +
+          `If you see two helpers, stop the duplicate manually or upgrade Docker Engine.`
+      );
+    }
     console.log(`✅ [SELF-UPDATE] New container started; it will take over name "${name}". Exiting.`);
     process.exit(0);
   } catch (err) {
@@ -2425,6 +2484,7 @@ async function runPendingAIRequests() {
 async function main() {
   // If we are the new container after a self-update, take over the original name (stop old, rename self)
   await runSelfUpdateTakeoverIfNeeded();
+  await removeOrphanedHelperSelfUpdateContainers();
 
   // Register engine first so it exists in the backend before we fetch config (config endpoint returns 404 otherwise)
   let registered = false;
