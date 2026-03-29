@@ -1205,6 +1205,11 @@ async function recreateContainerFromExisting(existingId, newImageUrl, containerN
     const oldContainer = docker.getContainer(existingId);
     const inspectData = await oldContainer.inspect();
     const createOpts = buildCreateOptsFromInspect(inspectData, newImageUrl, containerName);
+    // Cure must not inherit stale Env from an old image (e.g. missing CURE_ENGINE_ID). Refresh from helper.
+    if (label === 'cure') {
+      await fetchHelperConfig();
+      createOpts.Env = getCureServiceEnv();
+    }
     if (inspectData?.State?.Running) {
       await oldContainer.stop({ t: 10 }).catch(() => {});
     }
@@ -1270,6 +1275,7 @@ function getCureServiceEnv() {
     `CURE_TOKEN=${runnerToken}`,
     `SERVICE_TOKEN=${process.env.SERVICE_TOKEN || ''}`,
     `CURE_AGENT_ID=${process.env.CURE_AGENT_ID || `${ENGINE_ID}-cure`}`,
+    // Same ENGINE_ID the helper registers with admin; admin-api merges docker_engines by this for runtime-config.
     `CURE_ENGINE_ID=${ENGINE_ID}`,
     `CURSOR_WORKSPACE_ROOT=${process.env.CURE_WORKSPACE_ROOT || '/app'}`,
     `CURSOR_AGENT_COMMAND=${process.env.CURE_AGENT_COMMAND || ''}`,
