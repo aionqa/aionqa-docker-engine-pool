@@ -1202,6 +1202,60 @@ async function pullManagedImage(imageUrl, forcePull = false, label = 'service') 
   }
 }
 
+/** Base URL for admin-api (cure queue). Helper uses SERVICE_TOKEN to call bulk replan after cure image redeploy. */
+function resolveAdminApiBaseUrlForCureReplan() {
+  const direct = String(
+    process.env.HELPER_ADMIN_API_URL
+      || process.env.ADMIN_API_URL
+      || process.env.CURE_BACKEND_URL
+      || ''
+  ).trim();
+  if (direct) return direct.replace(/\/$/, '');
+  const b = String(process.env.BACKEND_URL || '').trim();
+  if (b.includes('://api.')) return b.replace('://api.', '://admin-api.').replace(/\/$/, '');
+  return '';
+}
+
+/**
+ * After a successful cure container redeploy (new image pulled / recreated), re-queue all terminal fix requests
+ * so runners perform a fresh plan on the updated image.
+ */
+async function notifyBulkCureReplanAfterCureImageRefresh(contextLabel = 'cure-redeploy') {
+  const base = resolveAdminApiBaseUrlForCureReplan();
+  const serviceToken = String(process.env.SERVICE_TOKEN || '').trim();
+  if (!base || !serviceToken) {
+    console.log(
+      `⏭️ Skipping bulk cure replan (${contextLabel}): ${!base ? 'set HELPER_ADMIN_API_URL, ADMIN_API_URL, or CURE_BACKEND_URL (or api.* BACKEND_URL)' : 'set SERVICE_TOKEN to match admin-api SERVICE_TOKEN'}`
+    );
+    return;
+  }
+  const url = `${base}/api/admin/cure/requests/replan-all-terminal`;
+  try {
+    const response = await axios.post(
+      url,
+      {
+        note: `Cure runner refreshed (${contextLabel}, engine ${ENGINE_ID}); queued fresh plans for completed/failed requests.`,
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${serviceToken}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 60000,
+      },
+    );
+    const mod = response.data?.modified_count;
+    const matched = response.data?.matched_count;
+    if (response.data?.ok) {
+      console.log(`✅ Bulk cure replan triggered: matched=${matched ?? '?'}, modified=${mod ?? '?'}`);
+    } else {
+      console.warn(`⚠️ Bulk cure replan unexpected response:`, response.data);
+    }
+  } catch (err) {
+    console.warn(`⚠️ Bulk cure replan request failed (${contextLabel}): ${err.message}`);
+  }
+}
+
 async function recreateContainerFromExisting(existingId, newImageUrl, containerName, label = 'service') {
   if (!existingId || !newImageUrl || !containerName) return false;
   try {
@@ -1225,6 +1279,9 @@ async function recreateContainerFromExisting(existingId, newImageUrl, containerN
     const newContainer = await docker.createContainer(createOpts);
     await newContainer.start();
     console.log(`✅ ${label} container redeployed: ${containerName}`);
+    if (label === 'cure') {
+      await notifyBulkCureReplanAfterCureImageRefresh('cure-container-redeploy');
+    }
     return true;
   } catch (error) {
     console.warn(`⚠️ Failed to redeploy ${label} container ${containerName}: ${error.message}`);
@@ -1389,7 +1446,7 @@ async function startCureServiceContainer(useCachedConfig = false) {
       hostConfig.Binds = [workspaceBind];
       console.log(`📁 Cure workspace bind: ${workspaceBind} → CURSOR_WORKSPACE_ROOT=${process.env.CURE_WORKSPACE_ROOT || process.env.CURSOR_WORKSPACE_ROOT || DEFAULT_CURE_WORKSPACE_CONTAINER}`);
     } else {
-      console.log('📁 Cure workspace: no host bind resolved (set CURE_WORKSPACE_BIND or AIONQA_WORKSPACE_HOST_PATH, or mount host dir on helper at /workspace)');
+      console.log('📁 Cure workspace: no host bind (clone or image layout: repos should live under CURSOR_WORKSPACE_ROOT, default /workspace)');
     }
 
     const container = await docker.createContainer({
