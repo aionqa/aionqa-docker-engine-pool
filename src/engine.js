@@ -1386,8 +1386,11 @@ function getCureServiceEnv() {
     `CURE_TOKEN=${runnerToken}`,
     `SERVICE_TOKEN=${process.env.SERVICE_TOKEN || ''}`,
     `CURE_AGENT_ID=${process.env.CURE_AGENT_ID || `${ENGINE_ID}-cure`}`,
-    // Same ENGINE_ID the helper registers with admin; admin-api merges docker_engines by this for runtime-config.
+    // Admin cure runtime-config: ENGINE_ID + runner_id (from token) so ADMIN_TOKEN auth can still merge the right docker_engines row.
     `CURE_ENGINE_ID=${ENGINE_ID}`,
+    `ENGINE_ID=${ENGINE_ID}`,
+    `AIONQA_DOCKER_RUNNER_ID=${RUNNER_ID}`,
+    `RUNNER_ID=${RUNNER_ID}`,
     `CURSOR_WORKSPACE_ROOT=${process.env.CURE_WORKSPACE_ROOT || process.env.CURSOR_WORKSPACE_ROOT || DEFAULT_CURE_WORKSPACE_CONTAINER}`,
     `CURSOR_AGENT_COMMAND=${process.env.CURE_AGENT_COMMAND || ''}`,
     `POLL_INTERVAL_MS=${process.env.CURE_POLL_INTERVAL_MS || '10000'}`,
