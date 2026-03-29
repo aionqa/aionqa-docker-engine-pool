@@ -59,6 +59,9 @@ console.log(`📅 Helper Build Date: ${HELPER_BUILD_DATE}`);
 // Note: We'll set authconfig per-pull, not globally
 const docker = new Docker({ socketPath: DOCKER_SOCKET });
 
+/** Monorepo root inside cure: sibling repos (submodules) live here — never default to /app (cure image app dir). */
+const DEFAULT_CURE_WORKSPACE_CONTAINER = '/workspace';
+
 // Log driver that supports reading (docker logs). Required so we can read container logs
 // when a container exits; daemon default may be journald/awslogs which don't support reading.
 const LOG_CONFIG_JSON_FILE = {
@@ -1205,10 +1208,15 @@ async function recreateContainerFromExisting(existingId, newImageUrl, containerN
     const oldContainer = docker.getContainer(existingId);
     const inspectData = await oldContainer.inspect();
     const createOpts = buildCreateOptsFromInspect(inspectData, newImageUrl, containerName);
-    // Cure must not inherit stale Env from an old image (e.g. missing CURE_ENGINE_ID). Refresh from helper.
+    // Cure must not inherit stale Env or binds from an old container (e.g. missing CURE_ENGINE_ID, wrong /app workspace).
     if (label === 'cure') {
       await fetchHelperConfig();
       createOpts.Env = getCureServiceEnv();
+      const wsBind = await resolveCureWorkspaceBindString();
+      if (wsBind) {
+        createOpts.HostConfig = createOpts.HostConfig || {};
+        createOpts.HostConfig.Binds = [wsBind];
+      }
     }
     if (inspectData?.State?.Running) {
       await oldContainer.stop({ t: 10 }).catch(() => {});
@@ -1222,6 +1230,52 @@ async function recreateContainerFromExisting(existingId, newImageUrl, containerN
     console.warn(`⚠️ Failed to redeploy ${label} container ${containerName}: ${error.message}`);
     return false;
   }
+}
+
+/**
+ * host:path[:mode] bind for cure workspace, or null (no bind).
+ * Priority: CURE_WORKSPACE_BIND → AIONQA_WORKSPACE_HOST_PATH (or CURE_WORKSPACE_HOST_PATH) → same host path as this helper's /workspace mount.
+ */
+async function resolveCureWorkspaceBindString() {
+  const explicit = String(process.env.CURE_WORKSPACE_BIND || '').trim();
+  if (explicit && explicit.includes(':')) return explicit;
+
+  const hostOnly = String(
+    process.env.AIONQA_WORKSPACE_HOST_PATH
+      || process.env.CURE_WORKSPACE_HOST_PATH
+      || ''
+  ).trim();
+  if (hostOnly) {
+    const dest = String(process.env.CURE_WORKSPACE_DEST_IN_CONTAINER || DEFAULT_CURE_WORKSPACE_CONTAINER).trim()
+      || DEFAULT_CURE_WORKSPACE_CONTAINER;
+    return `${hostOnly}:${dest}`;
+  }
+
+  const myId = getOwnContainerId();
+  if (!myId) return null;
+  try {
+    const data = await docker.getContainer(myId).inspect();
+    const binds = Array.isArray(data?.HostConfig?.Binds) ? data.HostConfig.Binds : [];
+    for (const b of binds) {
+      if (typeof b !== 'string') continue;
+      const marker = ':/workspace';
+      const idx = b.indexOf(marker);
+      if (idx < 0) continue;
+      const host = b.slice(0, idx);
+      const tail = b.slice(idx + marker.length);
+      if (!host) continue;
+      if (tail === '' || tail === ':rw' || tail === ':ro') {
+        return tail ? `${host}${marker}${tail}` : `${host}${marker}`;
+      }
+    }
+    const mounts = Array.isArray(data?.Mounts) ? data.Mounts : [];
+    for (const m of mounts) {
+      if (m?.Destination === '/workspace' && m.Source) {
+        return m.RW === false ? `${m.Source}:/workspace:ro` : `${m.Source}:/workspace`;
+      }
+    }
+  } catch (_) {}
+  return null;
 }
 
 async function checkCureServiceImageAndRestartIfUpdated() {
@@ -1277,7 +1331,7 @@ function getCureServiceEnv() {
     `CURE_AGENT_ID=${process.env.CURE_AGENT_ID || `${ENGINE_ID}-cure`}`,
     // Same ENGINE_ID the helper registers with admin; admin-api merges docker_engines by this for runtime-config.
     `CURE_ENGINE_ID=${ENGINE_ID}`,
-    `CURSOR_WORKSPACE_ROOT=${process.env.CURE_WORKSPACE_ROOT || '/app'}`,
+    `CURSOR_WORKSPACE_ROOT=${process.env.CURE_WORKSPACE_ROOT || process.env.CURSOR_WORKSPACE_ROOT || DEFAULT_CURE_WORKSPACE_CONTAINER}`,
     `CURSOR_AGENT_COMMAND=${process.env.CURE_AGENT_COMMAND || ''}`,
     `POLL_INTERVAL_MS=${process.env.CURE_POLL_INTERVAL_MS || '10000'}`,
     `CURE_EXEC_TIMEOUT_MS=${process.env.CURE_EXEC_TIMEOUT_MS || '2700000'}`,
@@ -1330,9 +1384,12 @@ async function startCureServiceContainer(useCachedConfig = false) {
       RestartPolicy: { Name: 'unless-stopped' },
       LogConfig: LOG_CONFIG_JSON_FILE,
     };
-    const workspaceBind = process.env.CURE_WORKSPACE_BIND;
-    if (workspaceBind && workspaceBind.includes(':')) {
+    const workspaceBind = await resolveCureWorkspaceBindString();
+    if (workspaceBind) {
       hostConfig.Binds = [workspaceBind];
+      console.log(`📁 Cure workspace bind: ${workspaceBind} → CURSOR_WORKSPACE_ROOT=${process.env.CURE_WORKSPACE_ROOT || process.env.CURSOR_WORKSPACE_ROOT || DEFAULT_CURE_WORKSPACE_CONTAINER}`);
+    } else {
+      console.log('📁 Cure workspace: no host bind resolved (set CURE_WORKSPACE_BIND or AIONQA_WORKSPACE_HOST_PATH, or mount host dir on helper at /workspace)');
     }
 
     const container = await docker.createContainer({
