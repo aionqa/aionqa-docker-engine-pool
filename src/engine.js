@@ -1398,6 +1398,9 @@ function getCureServiceEnv() {
     `CURE_RUNTIME_CONFIG_REFRESH_MS=${process.env.CURE_RUNTIME_CONFIG_REFRESH_MS || '300000'}`,
     `CURE_HTTP_RETRY_MAX_ATTEMPTS=${process.env.CURE_HTTP_RETRY_MAX_ATTEMPTS || '4'}`,
     `CURE_HTTP_RETRY_BASE_MS=${process.env.CURE_HTTP_RETRY_BASE_MS || '1000'}`,
+    // GitHub HTTPS clones (prefetch + repo sync): PAT from host or rely on admin-api CURE_GITHUB_TOKEN → runtime.secrets.
+    `GITHUB_TOKEN=${process.env.GITHUB_TOKEN || ''}`,
+    `GH_TOKEN=${process.env.GH_TOKEN || ''}`,
   ];
 }
 
