@@ -1470,8 +1470,114 @@ async function startCureServiceContainer(useCachedConfig = false) {
   }
 }
 
+/**
+ * Which managed images are behind registry digests (no pull). Used for self-hosted drift notices.
+ */
+async function collectOutdatedManagedImages() {
+  const out = [];
+  try {
+    const helperResp = await axios.post(
+      `${BACKEND_URL}/api/docker-engines/image-url`,
+      { image_name: 'aionqa-docker-engine-pool:latest' },
+      { headers: getAuthHeaders(), timeout: 10000 }
+    );
+    const hUrl = helperResp.data?.image_url;
+    const hSha = helperResp.data?.image_sha;
+    if (hUrl && hSha) {
+      try {
+        if (!(await localImageDigestMatchesSha(hUrl, hSha))) out.push('helper');
+      } catch (_) {}
+    }
+  } catch (_) {}
+
+  try {
+    const crawlResp = await axios.post(
+      `${BACKEND_URL}/api/docker-engines/image-url`,
+      { image_name: 'aionqa-unified-crawler:latest' },
+      { headers: getAuthHeaders(), timeout: 10000 }
+    );
+    const cUrl = crawlResp.data?.image_url;
+    const cSha = crawlResp.data?.image_sha;
+    if (cUrl && cSha) {
+      try {
+        if (!(await localImageDigestMatchesSha(cUrl, cSha))) out.push('crawler');
+      } catch (_) {}
+    }
+  } catch (_) {}
+
+  if (isAIServiceEnabled()) {
+    try {
+      const cn = getAIServiceContainerName();
+      const containers = await docker.listContainers({ all: true });
+      const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === cn));
+      if (existing) {
+        const aiResp = await axios.post(
+          `${BACKEND_URL}/api/docker-engines/image-url`,
+          { image_name: 'aionqa-ai-service:latest' },
+          { headers: getAuthHeaders(), timeout: 10000 }
+        );
+        const aiUrl = aiResp.data?.image_url;
+        const aiSha = aiResp.data?.image_sha;
+        if (aiUrl && aiSha) {
+          try {
+            if (!(await localImageDigestMatchesSha(aiUrl, aiSha))) out.push('ai_service');
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
+  if (isCureServiceEnabled()) {
+    try {
+      const cureName = getCureServiceContainerName();
+      const containers = await docker.listContainers({ all: true });
+      const existing = findContainerByName(containers, cureName);
+      if (existing) {
+        const r = await axios.post(
+          `${BACKEND_URL}/api/docker-engines/image-url`,
+          { image_name: 'aionqa-cure:latest' },
+          { headers: getAuthHeaders(), timeout: 10000 }
+        );
+        const cuUrl = r.data?.image_url;
+        const cuSha = r.data?.image_sha;
+        if (cuUrl && cuSha) {
+          try {
+            if (!(await localImageDigestMatchesSha(cuUrl, cuSha))) out.push('cure');
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
+  return out;
+}
+
+async function reportManagedImageDriftToBackend() {
+  if (autoUpdateManagedImages) return;
+  try {
+    const outdated = await collectOutdatedManagedImages();
+    await axios.post(
+      `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/managed-image-drift`,
+      { outdated },
+      { headers: getAuthHeaders(), timeout: 15000 }
+    );
+    if (outdated.length > 0) {
+      console.log(`ℹ️ [IMAGE-DRIFT] Reported outdated managed images (no auto-pull on self-hosted): ${outdated.join(', ')}`);
+    }
+  } catch (err) {
+    const st = err.response?.status;
+    if (st === 404 || st === 403) return;
+    console.warn(`⚠️ [IMAGE-DRIFT] Failed to report drift: ${err.message}`);
+  }
+}
+
 async function runAutomaticImageReconcile() {
   try {
+    if (!autoUpdateManagedImages) {
+      await reportManagedImageDriftToBackend();
+      return;
+    }
+
     const crawlerUpdated = await checkCrawlerImage();
     if (crawlerUpdated) {
       console.log(`✅ [AUTO-IMAGE] Crawler image updated (new jobs will use latest image).`);
@@ -1540,6 +1646,8 @@ const OLLAMA_CONTAINER_NAME = 'ollama';
 
 /** Helper config from API (fetched on startup; env overrides) */
 let helperConfig = null;
+/** When true (shared AionQA helpers), pull/restart managed images on a schedule. When false (self-hosted), only report drift for in-app user notices. */
+let autoUpdateManagedImages = true;
 
 function logStartupConfigSnapshot(source = 'api') {
   try {
@@ -1588,8 +1696,10 @@ async function fetchHelperConfig() {
     throw new Error('Backend returned no config (missing response.data.config).');
   }
   helperConfig = response.data.config;
+  const au = response.data.auto_update_managed_images;
+  autoUpdateManagedImages = au !== false;
   const provider = helperConfig.ai_service_provider || 'ollama';
-  console.log(`✅ Helper config loaded from API (ai_service_provider: ${provider}, ollama_model: ${helperConfig.ollama_model})`);
+  console.log(`✅ Helper config loaded from API (ai_service_provider: ${provider}, ollama_model: ${helperConfig.ollama_model}, auto_update_managed_images: ${autoUpdateManagedImages})`);
   logStartupConfigSnapshot('api');
 }
 
