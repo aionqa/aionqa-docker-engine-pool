@@ -47,11 +47,19 @@ if (RUNNER_NAME) console.log(`🏷️  Runner name: ${RUNNER_NAME} (crawler cont
 console.log(`🔗 Backend URL: ${BACKEND_URL}`);
 console.log(`⏱️  Poll interval: ${POLL_INTERVAL}ms`);
 console.log(`🔌 Docker socket: ${DOCKER_SOCKET}`);
-// Version info for image update verification
-const HELPER_VERSION = process.env.HELPER_VERSION || process.env.IMAGE_TAG || 'unknown';
+// Version info for image update verification (GIT_COMMIT baked in at docker build from CI)
+const HELPER_GIT_COMMIT = (
+  process.env.GIT_COMMIT ||
+  process.env.HELPER_GIT_COMMIT ||
+  process.env.SOURCE_COMMIT ||
+  'unknown'
+).trim();
+const HELPER_VERSION = process.env.HELPER_VERSION || process.env.IMAGE_TAG || HELPER_GIT_COMMIT || 'unknown';
 const HELPER_BUILD_DATE = process.env.BUILD_DATE || new Date().toISOString();
 const HELPER_CONTAINER_NAME = (process.env.HELPER_CONTAINER_NAME || process.env.CONTAINER_NAME || 'aionqa-helper').toLowerCase().replace(/^\//, '');
 const HELPER_IMAGE = process.env.HELPER_IMAGE || 'public.ecr.aws/k0f6y3u1/aionqa-docker-engine-pool:latest';
+console.log(`📌 HELPER_GIT_COMMIT=${HELPER_GIT_COMMIT}`);
+console.log(`📌 HELPER_GIT_REF=${String(process.env.GIT_REF || '').trim() || 'unknown'}`);
 console.log(`🏷️  Helper Version: ${HELPER_VERSION}`);
 console.log(`📅 Helper Build Date: ${HELPER_BUILD_DATE}`);
 
@@ -2717,6 +2725,9 @@ async function runPendingAIRequests() {
  * Main loop
  */
 async function main() {
+  console.log(
+    `🚀 AionQA helper main() starting | HELPER_GIT_COMMIT=${HELPER_GIT_COMMIT} | version=${HELPER_VERSION} | ENGINE_ID=${ENGINE_ID}`,
+  );
   // If we are the new container after a self-update, take over the original name (stop old, rename self)
   await runSelfUpdateTakeoverIfNeeded();
   await removeOrphanedHelperSelfUpdateContainers();
