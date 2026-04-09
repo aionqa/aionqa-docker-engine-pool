@@ -1517,7 +1517,13 @@ async function evaluateManagedImages() {
         services['aionqa-helper'] = { status: 'unknown', detail: String(e?.message || e) };
       }
     } else if (hUrl) {
-      services['aionqa-helper'] = { status: 'unknown', detail: 'Registry digest unavailable' };
+      const apiErr = helperResp.data?.image_sha_error;
+      services['aionqa-helper'] = {
+        status: 'unknown',
+        detail: apiErr
+          ? `Registry digest unavailable (${apiErr})`
+          : 'Registry digest unavailable (API returned no image_sha; ensure api role can call ecr-public:DescribeImages)'
+      };
     }
   } catch (e) {
     services['aionqa-helper'] = { status: 'unknown', detail: String(e?.message || e) };
