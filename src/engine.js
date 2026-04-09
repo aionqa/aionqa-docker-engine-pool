@@ -560,21 +560,34 @@ async function sendHeartbeat() {
       };
     }
     if (metrics && typeof metrics === 'object') {
-      metrics.image_version_checks = cachedImageVersionChecks || {
-        checked_at: null,
-        missing_capability: true,
-        interval_ms: IMAGE_CHECK_INTERVAL_MS,
-        helper_version: HELPER_VERSION,
-        detail:
-          'Registry image checks not initialized yet (waiting for first IMAGE-CHECK run after startup), or this build predates image_version_checks.',
-        // Admin UI maps each row via metrics.image_version_checks.services; without this object every column shows "—".
-        services: {
-          'aionqa-helper': { status: 'unknown', detail: 'Waiting for first registry comparison…' },
-          'aionqa-ai-service': { status: 'unknown', detail: 'Waiting for first registry comparison…' },
-          ollama: { status: 'unknown', detail: 'No registry baseline (third-party image)' },
-          'aionqa-cure': { status: 'unknown', detail: 'Waiting for first registry comparison…' }
-        }
-      };
+      const cacheOk =
+        cachedImageVersionChecks &&
+        typeof cachedImageVersionChecks === 'object' &&
+        cachedImageVersionChecks.services &&
+        typeof cachedImageVersionChecks.services === 'object';
+      if (!cacheOk) {
+        await refreshImageVersionCheckCache('heartbeat_backfill').catch((e) =>
+          console.warn(`⚠️ [HEARTBEAT] image_version_checks backfill failed: ${e.message}`)
+        );
+      }
+      const iv = cachedImageVersionChecks;
+      const ivOk = iv && typeof iv === 'object' && iv.services && typeof iv.services === 'object';
+      metrics.image_version_checks = ivOk
+        ? iv
+        : {
+            checked_at: null,
+            missing_capability: true,
+            interval_ms: IMAGE_CHECK_INTERVAL_MS,
+            helper_version: HELPER_VERSION,
+            detail:
+              'Registry image checks not initialized yet (waiting for first IMAGE-CHECK run after startup), or this build predates image_version_checks.',
+            services: {
+              'aionqa-helper': { status: 'unknown', detail: 'Waiting for first registry comparison…' },
+              'aionqa-ai-service': { status: 'unknown', detail: 'Waiting for first registry comparison…' },
+              ollama: { status: 'unknown', detail: 'No registry baseline (third-party image)' },
+              'aionqa-cure': { status: 'unknown', detail: 'Waiting for first registry comparison…' }
+            }
+          };
     }
     const system_info = getSystemInfo();
     try {
