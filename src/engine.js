@@ -5,6 +5,7 @@
 
 import Docker from 'dockerode';
 import axios from 'axios';
+import { getMetricImageFields } from './metricImageFields.js';
 import { hostname, cpus, platform, release, arch, networkInterfaces } from 'os';
 import { randomUUID } from 'crypto';
 import { readFileSync } from 'fs';
@@ -486,49 +487,6 @@ async function getGpuMetrics() {
 }
 
 /**
- * Best-effort: resolve image digest for heartbeat metrics. Docker listContainers often returns repo:tag or a short id;
- * admin-api compares registry digests to local using this (image_digest or image with @sha256).
- */
-async function getMetricImageFields(containerId, listImage) {
-  const image = String(listImage || '').trim();
-  const out = { image, image_digest: null };
-  try {
-    const cont = docker.getContainer(containerId);
-    const insp = await cont.inspect();
-    const ref = insp.Image;
-    const img = docker.getImage(ref);
-    const imgInsp = await img.inspect();
-    const repoDigests = Array.isArray(imgInsp.RepoDigests) ? imgInsp.RepoDigests : [];
-    for (const rd of repoDigests) {
-      const s = String(rd);
-      const at = s.lastIndexOf('@sha256:');
-      if (at >= 0) {
-        const hex = s.slice(at + '@sha256:'.length).toLowerCase();
-        if (/^[a-f0-9]{64}$/.test(hex)) {
-          out.image_digest = `sha256:${hex}`;
-          if (!image.includes('@sha256:')) {
-            const bare = image.split('@')[0];
-            out.image = bare ? `${bare}@sha256:${hex}` : `sha256:${hex}`;
-          }
-          return out;
-        }
-      }
-    }
-    const id = String(imgInsp.Id || ref || '');
-    const m = id.match(/sha256:([a-f0-9]{64})/i);
-    if (m) {
-      out.image_digest = `sha256:${m[1].toLowerCase()}`;
-      if (!image || (!image.includes('sha256:') && !/^[a-f0-9]{64}$/i.test(image))) {
-        out.image = out.image_digest;
-      }
-    }
-  } catch (_) {
-    /* keep list-only image */
-  }
-  return out;
-}
-
-/**
  * Collect runner metrics: host (from Docker info), GPU (if available), and per-container stats for AionQA-related containers.
  */
 async function collectRunnerMetrics() {
@@ -565,7 +523,7 @@ async function collectRunnerMetrics() {
         const container = docker.getContainer(c.Id);
         const [stats, imgFields] = await Promise.all([
           getContainerStatsOnce(container),
-          getMetricImageFields(c.Id, c.Image)
+          getMetricImageFields(docker, c.Id, c.Image)
         ]);
         const parsed = stats ? parseStatsBlob(stats) : {};
         out.containers.push({
@@ -581,7 +539,7 @@ async function collectRunnerMetrics() {
       } catch (_) {
         let imgFields = { image: c.Image || '', image_digest: null };
         try {
-          imgFields = await getMetricImageFields(c.Id, c.Image);
+          imgFields = await getMetricImageFields(docker, c.Id, c.Image);
         } catch (_) {
           /* ignore */
         }
