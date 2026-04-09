@@ -103,10 +103,15 @@ async function localImageDigestMatchesSha(imageRef, expectedSha) {
     const image = docker.getImage(imageRef);
     const info = await image.inspect();
     const repoDigests = Array.isArray(info?.RepoDigests) ? info.RepoDigests : [];
-    return repoDigests.some((digestRef) => {
+    const fromRepo = repoDigests.some((digestRef) => {
       const digest = String(digestRef || '').split('@').pop();
       return normalizeSha(digest) === shaNorm;
     });
+    if (fromRepo) return true;
+    // Some daemons leave RepoDigests empty for public-ecr :tag pulls; image Id is often the config digest
+    // and matches ECR DescribeImages for single-arch images.
+    if (info?.Id && imageIdMatchesSha(info.Id, shaNorm)) return true;
+    return false;
   } catch {
     return false;
   }
@@ -1842,8 +1847,14 @@ async function fetchHelperConfig() {
   }
   helperConfig = response.data.config;
   const au = response.data.auto_update_managed_images;
-  autoUpdateManagedImages = au !== false;
+  const forceAutoUpdate =
+    process.env.FORCE_AUTO_UPDATE_MANAGED_IMAGES === 'true' ||
+    process.env.FORCE_AUTO_UPDATE_MANAGED_IMAGES === '1';
+  autoUpdateManagedImages = forceAutoUpdate ? true : au !== false;
   const provider = helperConfig.ai_service_provider || 'ollama';
+  if (forceAutoUpdate) {
+    console.log('ℹ️ FORCE_AUTO_UPDATE_MANAGED_IMAGES is set; managed images will auto-pull/restart regardless of API flag.');
+  }
   console.log(`✅ Helper config loaded from API (ai_service_provider: ${provider}, ollama_model: ${helperConfig.ollama_model}, auto_update_managed_images: ${autoUpdateManagedImages})`);
   logStartupConfigSnapshot('api');
 }
