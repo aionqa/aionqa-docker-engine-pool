@@ -549,11 +549,22 @@ async function sendHeartbeat() {
     let metrics = null;
     try {
       metrics = await collectRunnerMetrics();
-      if (metrics && typeof metrics === 'object' && cachedImageVersionChecks) {
-        metrics.image_version_checks = cachedImageVersionChecks;
-      }
     } catch (err) {
       console.warn(`⚠️ Metrics collection failed:`, err.message);
+      metrics = {
+        collected_at: new Date().toISOString(),
+        host: null,
+        gpu: null,
+        containers: [],
+        metrics_collection_error: String(err?.message || err)
+      };
+    }
+    if (metrics && typeof metrics === 'object') {
+      metrics.image_version_checks = cachedImageVersionChecks || {
+        checked_at: null,
+        missing_capability: true,
+        detail: 'Registry image checks not initialized yet (waiting for first IMAGE-CHECK run), or this container is an older helper image without this feature.'
+      };
     }
     const system_info = getSystemInfo();
     try {
@@ -1590,6 +1601,42 @@ async function evaluateManagedImages() {
   return { checked_at, services, outdated };
 }
 
+/**
+ * Run registry digest comparison and store for heartbeats. Safe to call often; heavy work is bounded by callers.
+ * @param {string} reason - e.g. startup | auto_reconcile
+ */
+async function refreshImageVersionCheckCache(reason = 'interval') {
+  try {
+    const evaluation = await evaluateManagedImages();
+    cachedImageVersionChecks = {
+      checked_at: evaluation.checked_at,
+      services: evaluation.services,
+      check_reason: reason,
+      interval_ms: IMAGE_CHECK_INTERVAL_MS,
+      helper_version: HELPER_VERSION
+    };
+    console.log(`✅ [IMAGE-CHECK] Registry comparison done (${reason}), checked_at=${evaluation.checked_at}`);
+    return evaluation;
+  } catch (err) {
+    const checked_at = new Date().toISOString();
+    console.warn(`⚠️ [IMAGE-CHECK] Registry comparison failed (${reason}): ${err.message}`);
+    cachedImageVersionChecks = {
+      checked_at,
+      services: {
+        'aionqa-helper': { status: 'unknown', detail: String(err?.message || err) },
+        'aionqa-ai-service': { status: 'unknown', detail: 'Check failed' },
+        ollama: { status: 'unknown', detail: 'No registry baseline (third-party image)' },
+        'aionqa-cure': { status: 'unknown', detail: 'Check failed' }
+      },
+      check_reason: reason,
+      error: String(err?.message || err),
+      interval_ms: IMAGE_CHECK_INTERVAL_MS,
+      helper_version: HELPER_VERSION
+    };
+    return null;
+  }
+}
+
 async function collectOutdatedManagedImages() {
   try {
     const { outdated } = await evaluateManagedImages();
@@ -1620,16 +1667,7 @@ async function reportManagedImageDriftToBackend(precomputedOutdated = null) {
 
 async function runAutomaticImageReconcile() {
   try {
-    let evaluation = null;
-    try {
-      evaluation = await evaluateManagedImages();
-      cachedImageVersionChecks = {
-        checked_at: evaluation.checked_at,
-        services: evaluation.services
-      };
-    } catch (err) {
-      console.warn(`⚠️ [AUTO-IMAGE] Image version evaluation failed: ${err.message}`);
-    }
+    const evaluation = await refreshImageVersionCheckCache('auto_reconcile');
 
     if (!autoUpdateManagedImages) {
       await reportManagedImageDriftToBackend(evaluation ? evaluation.outdated : null);
@@ -2684,6 +2722,11 @@ async function main() {
   // Require config after registration: missing config, backend down, or wrong token → throw and exit
   await fetchHelperConfig();
 
+  // Compare local images to registry digests early so admin UI gets `metrics.image_version_checks` on first heartbeat
+  await refreshImageVersionCheckCache('startup').catch((err) =>
+    console.warn(`⚠️ [IMAGE-CHECK] Startup comparison skipped: ${err.message}`)
+  );
+
   await ensureAionqaNetwork().catch(err => console.warn('⚠️ Ensure network failed:', err.message));
   // Load config and start Ollama / AI service once (reconcileServices fetches config; no need to fetch twice)
   await reconcileServices();
@@ -2695,7 +2738,8 @@ async function main() {
     reconcileServices().catch(err => console.warn('⚠️ [STARTUP] Delayed reconcile failed:', err.message));
   }, STARTUP_RECONCILE_DELAY_MS);
 
-  // Send heartbeat every 30 seconds
+  // Send heartbeat every 30 seconds; one immediate beat so DB has metrics (including image_version_checks) without waiting
+  sendHeartbeat().catch(() => {});
   setInterval(sendHeartbeat, 30000);
   // No periodic reconcile: Docker handles restarts. Start/stop/update only when UI sends pending actions.
 
