@@ -73,6 +73,8 @@ const LOG_CONFIG_JSON_FILE = {
 const runningContainers = new Map();
 let helperRestartPendingFromImageUpdate = false;
 let helperPendingImageUrl = null;
+/** Latest registry vs local digest comparison (refreshed on IMAGE_CHECK_INTERVAL_MS). Sent with heartbeats for admin UI. */
+let cachedImageVersionChecks = null;
 
 function normalizeSha(value) {
   return String(value || '').trim().replace(/^sha256:/, '').toLowerCase();
@@ -547,6 +549,9 @@ async function sendHeartbeat() {
     let metrics = null;
     try {
       metrics = await collectRunnerMetrics();
+      if (metrics && typeof metrics === 'object' && cachedImageVersionChecks) {
+        metrics.image_version_checks = cachedImageVersionChecks;
+      }
     } catch (err) {
       console.warn(`⚠️ Metrics collection failed:`, err.message);
     }
@@ -1471,10 +1476,19 @@ async function startCureServiceContainer(useCachedConfig = false) {
 }
 
 /**
- * Which managed images are behind registry digests (no pull). Used for self-hosted drift notices.
+ * Compare managed images to registry digests (no pull). Populates UI-facing checks and drift list for self-hosted.
+ * @returns {{ checked_at: string, services: Record<string, { status: string, registry_digest?: string, detail?: string }>, outdated: string[] }}
  */
-async function collectOutdatedManagedImages() {
-  const out = [];
+async function evaluateManagedImages() {
+  const checked_at = new Date().toISOString();
+  const services = {
+    'aionqa-helper': { status: 'unknown', detail: 'Not evaluated' },
+    'aionqa-ai-service': { status: 'unknown', detail: 'Not evaluated' },
+    ollama: { status: 'unknown', detail: 'No registry baseline (third-party image)' },
+    'aionqa-cure': { status: 'unknown', detail: 'Not evaluated' }
+  };
+  const outdated = [];
+
   try {
     const helperResp = await axios.post(
       `${BACKEND_URL}/api/docker-engines/image-url`,
@@ -1485,10 +1499,18 @@ async function collectOutdatedManagedImages() {
     const hSha = helperResp.data?.image_sha;
     if (hUrl && hSha) {
       try {
-        if (!(await localImageDigestMatchesSha(hUrl, hSha))) out.push('helper');
-      } catch (_) {}
+        const match = await localImageDigestMatchesSha(hUrl, hSha);
+        services['aionqa-helper'] = { status: match ? 'up_to_date' : 'update_available', registry_digest: hSha };
+        if (!match) outdated.push('helper');
+      } catch (e) {
+        services['aionqa-helper'] = { status: 'unknown', detail: String(e?.message || e) };
+      }
+    } else if (hUrl) {
+      services['aionqa-helper'] = { status: 'unknown', detail: 'Registry digest unavailable' };
     }
-  } catch (_) {}
+  } catch (e) {
+    services['aionqa-helper'] = { status: 'unknown', detail: String(e?.message || e) };
+  }
 
   try {
     const crawlResp = await axios.post(
@@ -1500,7 +1522,7 @@ async function collectOutdatedManagedImages() {
     const cSha = crawlResp.data?.image_sha;
     if (cUrl && cSha) {
       try {
-        if (!(await localImageDigestMatchesSha(cUrl, cSha))) out.push('crawler');
+        if (!(await localImageDigestMatchesSha(cUrl, cSha))) outdated.push('crawler');
       } catch (_) {}
     }
   } catch (_) {}
@@ -1510,21 +1532,29 @@ async function collectOutdatedManagedImages() {
       const cn = getAIServiceContainerName();
       const containers = await docker.listContainers({ all: true });
       const existing = containers.find(c => c.Names && c.Names.some(n => n.replace(/^\//, '') === cn));
-      if (existing) {
-        const aiResp = await axios.post(
-          `${BACKEND_URL}/api/docker-engines/image-url`,
-          { image_name: 'aionqa-ai-service:latest' },
-          { headers: getAuthHeaders(), timeout: 10000 }
-        );
-        const aiUrl = aiResp.data?.image_url;
-        const aiSha = aiResp.data?.image_sha;
-        if (aiUrl && aiSha) {
-          try {
-            if (!(await localImageDigestMatchesSha(aiUrl, aiSha))) out.push('ai_service');
-          } catch (_) {}
+      const aiResp = await axios.post(
+        `${BACKEND_URL}/api/docker-engines/image-url`,
+        { image_name: 'aionqa-ai-service:latest' },
+        { headers: getAuthHeaders(), timeout: 10000 }
+      );
+      const aiUrl = aiResp.data?.image_url;
+      const aiSha = aiResp.data?.image_sha;
+      if (aiUrl && aiSha) {
+        try {
+          const match = await localImageDigestMatchesSha(aiUrl, aiSha);
+          services['aionqa-ai-service'] = { status: match ? 'up_to_date' : 'update_available', registry_digest: aiSha };
+          if (!match && existing) outdated.push('ai_service');
+        } catch (e) {
+          services['aionqa-ai-service'] = { status: 'unknown', detail: String(e?.message || e) };
         }
+      } else if (aiUrl) {
+        services['aionqa-ai-service'] = { status: 'unknown', detail: 'Registry digest unavailable' };
       }
-    } catch (_) {}
+    } catch (e) {
+      services['aionqa-ai-service'] = { status: 'unknown', detail: String(e?.message || e) };
+    }
+  } else {
+    services['aionqa-ai-service'] = { status: 'skipped', detail: 'Managed AI container not used (cloud/balance or disabled)' };
   }
 
   if (isCureServiceEnabled()) {
@@ -1532,30 +1562,47 @@ async function collectOutdatedManagedImages() {
       const cureName = getCureServiceContainerName();
       const containers = await docker.listContainers({ all: true });
       const existing = findContainerByName(containers, cureName);
-      if (existing) {
-        const r = await axios.post(
-          `${BACKEND_URL}/api/docker-engines/image-url`,
-          { image_name: 'aionqa-cure:latest' },
-          { headers: getAuthHeaders(), timeout: 10000 }
-        );
-        const cuUrl = r.data?.image_url;
-        const cuSha = r.data?.image_sha;
-        if (cuUrl && cuSha) {
-          try {
-            if (!(await localImageDigestMatchesSha(cuUrl, cuSha))) out.push('cure');
-          } catch (_) {}
+      const r = await axios.post(
+        `${BACKEND_URL}/api/docker-engines/image-url`,
+        { image_name: 'aionqa-cure:latest' },
+        { headers: getAuthHeaders(), timeout: 10000 }
+      );
+      const cuUrl = r.data?.image_url;
+      const cuSha = r.data?.image_sha;
+      if (cuUrl && cuSha) {
+        try {
+          const match = await localImageDigestMatchesSha(cuUrl, cuSha);
+          services['aionqa-cure'] = { status: match ? 'up_to_date' : 'update_available', registry_digest: cuSha };
+          if (!match && existing) outdated.push('cure');
+        } catch (e) {
+          services['aionqa-cure'] = { status: 'unknown', detail: String(e?.message || e) };
         }
+      } else if (cuUrl) {
+        services['aionqa-cure'] = { status: 'unknown', detail: 'Registry digest unavailable' };
       }
-    } catch (_) {}
+    } catch (e) {
+      services['aionqa-cure'] = { status: 'unknown', detail: String(e?.message || e) };
+    }
+  } else {
+    services['aionqa-cure'] = { status: 'skipped', detail: 'Cure service disabled' };
   }
 
-  return out;
+  return { checked_at, services, outdated };
 }
 
-async function reportManagedImageDriftToBackend() {
+async function collectOutdatedManagedImages() {
+  try {
+    const { outdated } = await evaluateManagedImages();
+    return outdated;
+  } catch (_) {
+    return [];
+  }
+}
+
+async function reportManagedImageDriftToBackend(precomputedOutdated = null) {
   if (autoUpdateManagedImages) return;
   try {
-    const outdated = await collectOutdatedManagedImages();
+    const outdated = Array.isArray(precomputedOutdated) ? precomputedOutdated : await collectOutdatedManagedImages();
     await axios.post(
       `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/managed-image-drift`,
       { outdated },
@@ -1573,8 +1620,19 @@ async function reportManagedImageDriftToBackend() {
 
 async function runAutomaticImageReconcile() {
   try {
+    let evaluation = null;
+    try {
+      evaluation = await evaluateManagedImages();
+      cachedImageVersionChecks = {
+        checked_at: evaluation.checked_at,
+        services: evaluation.services
+      };
+    } catch (err) {
+      console.warn(`⚠️ [AUTO-IMAGE] Image version evaluation failed: ${err.message}`);
+    }
+
     if (!autoUpdateManagedImages) {
-      await reportManagedImageDriftToBackend();
+      await reportManagedImageDriftToBackend(evaluation ? evaluation.outdated : null);
       return;
     }
 
