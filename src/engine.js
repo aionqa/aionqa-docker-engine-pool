@@ -300,6 +300,30 @@ async function getDockerDaemonInfo() {
 }
 
 /**
+ * Normalize image inspect to a sha256:… digest for heartbeats (version_sha) and comparisons.
+ */
+async function digestFromDockerImageRef(imageRef) {
+  if (!imageRef) return null;
+  try {
+    const img = docker.getImage(imageRef);
+    const inspect = await img.inspect();
+    const digests = inspect.RepoDigests || [];
+    if (digests.length > 0) {
+      const d = String(digests[0]);
+      if (d.includes('@')) return d.split('@').pop();
+      return d.startsWith('sha256:') ? d : `sha256:${d}`;
+    }
+    const id = String(inspect.Id || '').trim();
+    if (id.startsWith('sha256:') && /^sha256:[a-f0-9]{64}$/i.test(id)) return id.toLowerCase();
+    const bare = id.replace(/^sha256:/i, '').toLowerCase();
+    if (/^[a-f0-9]{64}$/.test(bare)) return `sha256:${bare}`;
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
  * Get helper image digest (SHA) - from env or by inspecting current container's image
  */
 async function getHelperImageDigest() {
@@ -308,23 +332,33 @@ async function getHelperImageDigest() {
     return d.startsWith('sha256:') ? d : `sha256:${d}`;
   }
   try {
+    const myId = getOwnContainerId();
+    if (myId) {
+      try {
+        const cont = docker.getContainer(myId);
+        const cinsp = await cont.inspect();
+        const fromSelf = await digestFromDockerImageRef(cinsp.Image);
+        if (fromSelf) return fromSelf;
+      } catch (_) {}
+    }
+
     const containers = await docker.listContainers({ all: true });
-    const selfName = hostname() || HELPER_CONTAINER_NAME;
+    const selfName = String(hostname() || '').toLowerCase();
+    const helperName = String(HELPER_CONTAINER_NAME || '').toLowerCase();
     const self = containers.find(c =>
-      (c.Names || []).some(n => n.includes(selfName) || n.includes(HELPER_CONTAINER_NAME))
+      (c.Names || []).some(n => {
+        const nn = String(n).replace(/^\//, '').toLowerCase();
+        return (
+          (selfName && nn.includes(selfName)) ||
+          (helperName && nn.includes(helperName)) ||
+          nn.includes('aionqa-docker-engine') ||
+          nn.includes('docker-engine-pool')
+        );
+      })
     );
     if (!self) return null;
     const imageRef = self.ImageID || self.Image;
-    if (!imageRef) return null;
-    const img = docker.getImage(imageRef);
-    const inspect = await img.inspect();
-    const digests = inspect.RepoDigests || [];
-    if (digests.length > 0) {
-      const d = digests[0];
-      return d.includes('@') ? d.split('@')[1] : d;
-    }
-    const id = inspect.Id;
-    return id ? (id.startsWith('sha256:') ? id : `sha256:${id}`) : null;
+    return await digestFromDockerImageRef(imageRef);
   } catch (_) {
     return null;
   }
@@ -1458,7 +1492,7 @@ function getCureServiceEnv() {
     `CURSOR_WORKSPACE_ROOT=${process.env.CURE_WORKSPACE_ROOT || process.env.CURSOR_WORKSPACE_ROOT || DEFAULT_CURE_WORKSPACE_CONTAINER}`,
     `CURSOR_AGENT_COMMAND=${process.env.CURE_AGENT_COMMAND || ''}`,
     `POLL_INTERVAL_MS=${process.env.CURE_POLL_INTERVAL_MS || '10000'}`,
-    `CURE_EXEC_TIMEOUT_MS=${process.env.CURE_EXEC_TIMEOUT_MS || '2700000'}`,
+    `CURE_EXEC_TIMEOUT_MS=${process.env.CURE_EXEC_TIMEOUT_MS || '7200000'}`,
     `CURE_RUNTIME_CONFIG_REFRESH_MS=${process.env.CURE_RUNTIME_CONFIG_REFRESH_MS || '300000'}`,
     `CURE_HTTP_RETRY_MAX_ATTEMPTS=${process.env.CURE_HTTP_RETRY_MAX_ATTEMPTS || '4'}`,
     `CURE_HTTP_RETRY_BASE_MS=${process.env.CURE_HTTP_RETRY_BASE_MS || '1000'}`,
