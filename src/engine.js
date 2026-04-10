@@ -1722,10 +1722,21 @@ async function reportManagedImageDriftToBackend(precomputedOutdated = null) {
 async function runAutomaticImageReconcile() {
   try {
     const evaluation = await refreshImageVersionCheckCache('auto_reconcile');
+    const noActiveCrawlJobs = runningContainers.size === 0 && processingJobs.size === 0;
+    const hasOutdated =
+      evaluation && Array.isArray(evaluation.outdated) && evaluation.outdated.length > 0;
+    const runIdleAutoUpdate =
+      !autoUpdateManagedImages && autoUpdateManagedImagesWhenIdle && noActiveCrawlJobs && hasOutdated;
 
-    if (!autoUpdateManagedImages) {
+    if (!autoUpdateManagedImages && !runIdleAutoUpdate) {
       await reportManagedImageDriftToBackend(evaluation ? evaluation.outdated : null);
       return;
+    }
+
+    if (runIdleAutoUpdate) {
+      console.log(
+        `🔄 [AUTO-IMAGE] Self-hosted idle update: applying outdated components (${evaluation.outdated.join(', ')}) — no active crawl jobs.`
+      );
     }
 
     const crawlerUpdated = await checkCrawlerImage();
@@ -1798,6 +1809,8 @@ const OLLAMA_CONTAINER_NAME = 'ollama';
 let helperConfig = null;
 /** When true (shared AionQA helpers), pull/restart managed images on a schedule. When false (self-hosted), only report drift for in-app user notices. */
 let autoUpdateManagedImages = true;
+/** When autoUpdateManagedImages is false: if true, still pull/restart when backend/registry says images are outdated and there are no active crawl jobs. */
+let autoUpdateManagedImagesWhenIdle = true;
 
 function logStartupConfigSnapshot(source = 'api') {
   try {
@@ -1851,11 +1864,21 @@ async function fetchHelperConfig() {
     process.env.FORCE_AUTO_UPDATE_MANAGED_IMAGES === 'true' ||
     process.env.FORCE_AUTO_UPDATE_MANAGED_IMAGES === '1';
   autoUpdateManagedImages = forceAutoUpdate ? true : au !== false;
+  const disableIdleEnv =
+    process.env.DISABLE_IDLE_AUTO_IMAGE_UPDATE === 'true' ||
+    process.env.DISABLE_IDLE_AUTO_IMAGE_UPDATE === '1';
+  const idleCfg = helperConfig.auto_update_managed_images_when_idle;
+  autoUpdateManagedImagesWhenIdle = !disableIdleEnv && idleCfg !== false;
   const provider = helperConfig.ai_service_provider || 'ollama';
   if (forceAutoUpdate) {
     console.log('ℹ️ FORCE_AUTO_UPDATE_MANAGED_IMAGES is set; managed images will auto-pull/restart regardless of API flag.');
   }
-  console.log(`✅ Helper config loaded from API (ai_service_provider: ${provider}, ollama_model: ${helperConfig.ollama_model}, auto_update_managed_images: ${autoUpdateManagedImages})`);
+  if (disableIdleEnv) {
+    console.log('ℹ️ DISABLE_IDLE_AUTO_IMAGE_UPDATE is set; skipping idle-only auto image updates for self-hosted helpers.');
+  }
+  console.log(
+    `✅ Helper config loaded from API (ai_service_provider: ${provider}, ollama_model: ${helperConfig.ollama_model}, auto_update_managed_images: ${autoUpdateManagedImages}, auto_update_managed_images_when_idle: ${autoUpdateManagedImagesWhenIdle})`
+  );
   logStartupConfigSnapshot('api');
 }
 
