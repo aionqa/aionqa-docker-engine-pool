@@ -33,10 +33,19 @@ export function resolveMetricImageFields(listImage, containerImageRef, imageInsp
     }
   }
 
-  const id = String(imgInsp.Id || containerImageRef || "");
-  const m = id.match(/sha256:([a-f0-9]{64})/i);
+  const rawRef = String(imgInsp.Id || containerImageRef || "").trim();
+  const m = rawRef.match(/sha256:([a-f0-9]{64})/i);
   if (m) {
     out.image_digest = `sha256:${m[1].toLowerCase()}`;
+    if (!image || (!image.includes("sha256:") && !/^[a-f0-9]{64}$/i.test(image))) {
+      out.image = out.image_digest;
+    }
+    return out;
+  }
+  // Some daemons return a bare 64-hex config id (no "sha256:" prefix) on image or container inspect.Image.
+  const bare = rawRef.replace(/^sha256:/i, "").toLowerCase();
+  if (/^[a-f0-9]{64}$/.test(bare)) {
+    out.image_digest = `sha256:${bare}`;
     if (!image || (!image.includes("sha256:") && !/^[a-f0-9]{64}$/i.test(image))) {
       out.image = out.image_digest;
     }
