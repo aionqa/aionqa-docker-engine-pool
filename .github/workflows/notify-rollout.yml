@@ -1,5 +1,5 @@
 # Run this workflow when you want all helpers to restart and pick up the latest image.
-# Does not build or push; only notifies the backend so helpers exit on next poll (restart: always).
+# Does not build or push; only notifies admin-api so helpers exit on next poll (restart: always).
 name: Notify helpers (rollout)
 
 on:
@@ -7,22 +7,14 @@ on:
 
 jobs:
   notify:
-    name: Notify backend – restart all helpers
+    name: Notify admin-api – restart shared helpers
     runs-on: [self-hosted, aionqa-ci]
     steps:
-      - name: Notify backend
-        env:
-          NOTIFY_SECRET: ${{ secrets.NOTIFY_NEW_IMAGE_SECRET }}
-          API_URL: ${{ vars.AIONQA_API_URL || 'https://api.aionqa.com' }}
+      - name: Notify admin-api
         run: |
-          if [ -z "$NOTIFY_SECRET" ]; then
-            echo "::error::NOTIFY_NEW_IMAGE_SECRET secret not set. Add it in repo Settings > Secrets."
-            exit 1
-          fi
-          echo "Notifying $API_URL – all helpers will restart on next poll."
-          curl -sS -X POST "$API_URL/api/docker-engines/notify-new-image" \
+          echo "POST https://admin-api.aionqa.com/api/admin/docker-engines/notify-new-image (image=aionqa-docker-engine-pool)"
+          curl -fsS -X POST "https://admin-api.aionqa.com/api/admin/docker-engines/notify-new-image" \
             -H "Content-Type: application/json" \
-            -H "X-Notify-New-Image-Secret: $NOTIFY_SECRET" \
             -d '{"image":"aionqa-docker-engine-pool"}'
           echo ""
-          echo "✅ Done. Helpers will restart on next poll."
+          echo "✅ Done. Shared helpers will restart on next poll."

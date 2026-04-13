@@ -62,3 +62,11 @@ jobs:
           docker tag ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest ${{ env.ECR_PUBLIC_URI }}:latest
           docker push ${{ env.ECR_PUBLIC_URI }}:latest
           echo "✅ Helper image pushed to ECR Public: ${{ env.ECR_PUBLIC_URI }}:latest"
+
+      - name: Notify shared helpers to pull new image
+        if: success()
+        run: |
+          curl -fsS -X POST "https://admin-api.aionqa.com/api/admin/docker-engines/notify-new-image" \
+            -H "Content-Type: application/json" \
+            -d '{"image":"aionqa-docker-engine-pool"}'
+          echo "✅ Admin-api notified; shared helpers will restart on next poll."
