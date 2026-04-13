@@ -21,7 +21,8 @@ const RUNNER_NAME = process.env.RUNNER_NAME || null;
 /** For logging; backend runner_id comes from token. */
 const RUNNER_ID = process.env.RUNNER_ID || ENGINE_ID;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '5000'); // 5 seconds
-const IMAGE_CHECK_INTERVAL_MS = parseInt(process.env.IMAGE_CHECK_INTERVAL_MS || '300000'); // 5 minutes
+/** How often to compare local digests to the registry and run auto-pull/restart. Default 30s so updates apply soon after publish; override with IMAGE_CHECK_INTERVAL_MS if too chatty. */
+const IMAGE_CHECK_INTERVAL_MS = parseInt(process.env.IMAGE_CHECK_INTERVAL_MS || '30000'); // 30 seconds
 const DOCKER_SOCKET = process.env.DOCKER_SOCKET || '/var/run/docker.sock';
 // ECR repositories are public - no AWS credentials needed
 // Helper uses ENGINE_TOKEN (project credentials) for backend authentication only
@@ -600,6 +601,35 @@ async function collectRunnerMetrics() {
   return out;
 }
 
+/** Throttle extra reconcile runs from heartbeat when the cache already shows drift (same gates as {@link runAutomaticImageReconcile}). */
+let lastHeartbeatAutoReconcileMs = 0;
+const HEARTBEAT_AUTO_RECONCILE_MIN_MS = 20000;
+
+function cacheShowsUpdateAvailable() {
+  const iv = cachedImageVersionChecks;
+  if (!iv || !iv.services || typeof iv.services !== 'object') return false;
+  return Object.values(iv.services).some(s => s && s.status === 'update_available');
+}
+
+/**
+ * True when automatic pull/restart is allowed (shared runners always; self-hosted only when idle auto-update is on and no crawl jobs).
+ * Mirrors the gate inside runAutomaticImageReconcile before pull logic runs.
+ */
+function shouldAttemptAutoImageReconcileNow() {
+  const noActiveCrawlJobs = runningContainers.size === 0 && processingJobs.size === 0;
+  if (autoUpdateManagedImages) return true;
+  return !autoUpdateManagedImages && autoUpdateManagedImagesWhenIdle && noActiveCrawlJobs;
+}
+
+async function maybeReconcileImagesFromHeartbeat() {
+  if (!cacheShowsUpdateAvailable()) return;
+  if (!shouldAttemptAutoImageReconcileNow()) return;
+  const now = Date.now();
+  if (now - lastHeartbeatAutoReconcileMs < HEARTBEAT_AUTO_RECONCILE_MIN_MS) return;
+  lastHeartbeatAutoReconcileMs = now;
+  await runAutomaticImageReconcile();
+}
+
 /**
  * Send heartbeat to backend (includes runner metrics when available)
  */
@@ -667,6 +697,7 @@ async function sendHeartbeat() {
       },
       { headers: getAuthHeaders(), timeout: 15000 }
     ), 'heartbeat');
+    void maybeReconcileImagesFromHeartbeat().catch(() => {});
   } catch (error) {
     // Logged by withBackendRetry; heartbeat is best-effort
   }
