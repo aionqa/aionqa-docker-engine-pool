@@ -12,7 +12,7 @@ import { readFileSync } from 'fs';
 
 // Default to 'back' service name for docker-compose networks
 // In Docker Compose, services are resolved by service name, not container name
-const BACKEND_URL = process.env.BACKEND_URL || 'http://back:4000';
+const BACKEND_URL = process.env.BACKEND_URL || 'https://api.aionqa.com';
 const ENGINE_TOKEN = process.env.ENGINE_TOKEN; // Token for authenticating with backend
 const SERVICE_KEY = process.env.SERVICE_KEY; // Optional service key for image URL retrieval
 const ENGINE_ID = process.env.ENGINE_ID || `docker-engine-${hostname()}-${randomUUID().substring(0, 8)}`;
