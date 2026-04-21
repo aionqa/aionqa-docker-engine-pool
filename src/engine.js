@@ -136,18 +136,48 @@ function findContainerByName(containers, requestedName) {
 /** Backend retry delays: 10s, 30s, 3min. Runners continue without interruption when backend restarts; only admin explicit cleanup clears state. */
 const BACKEND_RETRY_DELAYS_MS = [10 * 1000, 30 * 1000, 3 * 60 * 1000];
 const BACKEND_RETRY_ATTEMPTS = 1 + BACKEND_RETRY_DELAYS_MS.length; // 4 total
+const BACKEND_RETRY_AFTER_CAP_MS = 3 * 60 * 1000; // never honor a Retry-After larger than 3 minutes
 
 function isRetryableBackendError(error) {
   if (!error) return false;
   const code = error.code || '';
   const status = error.response?.status;
   if (['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'ENOTFOUND', 'ENETUNREACH'].includes(code)) return true;
-  if (status >= 500 || status === 408) return true;
+  if (status >= 500 || status === 408 || status === 429) return true;
   return false;
 }
 
 /**
- * Run a backend request with retries: 10s, 30s, 3min. Log after all attempts if still failing.
+ * Parse a Retry-After header value (seconds OR HTTP-date) into milliseconds.
+ * Returns null if the header is absent or unparseable. Capped at
+ * BACKEND_RETRY_AFTER_CAP_MS so a misconfigured backend can't stall us forever.
+ */
+function parseRetryAfterMs(error) {
+  const headers = error?.response?.headers;
+  if (!headers) return null;
+  // axios lower-cases header keys
+  const raw = headers['retry-after'] ?? headers['Retry-After'];
+  if (raw == null) return null;
+  const str = String(raw).trim();
+  if (!str) return null;
+  const asInt = Number(str);
+  let ms;
+  if (Number.isFinite(asInt)) {
+    ms = Math.max(0, asInt) * 1000;
+  } else {
+    const dateMs = Date.parse(str);
+    if (!Number.isFinite(dateMs)) return null;
+    ms = Math.max(0, dateMs - Date.now());
+  }
+  return Math.min(ms, BACKEND_RETRY_AFTER_CAP_MS);
+}
+
+/**
+ * Run a backend request with retries: 10s, 30s, 3min by default; if the
+ * backend returns 503/429 with a `Retry-After` header, that value is honored
+ * instead (capped at 3 min). Helpers/runners must keep going across backend
+ * restarts and overload events.
+ *
  * @param {() => Promise<T>} fn - Async function that performs the request (no args).
  * @param {string} label - Label for logging (e.g. "poll", "heartbeat", "job/123/complete").
  * @returns {Promise<T|null>} Resolved value or null if all attempts failed (caller can treat null as no-op where appropriate).
@@ -162,8 +192,11 @@ async function withBackendRetry(fn, label) {
       if (!isRetryableBackendError(error) || attempt === BACKEND_RETRY_ATTEMPTS) {
         break;
       }
-      const delayMs = BACKEND_RETRY_DELAYS_MS[attempt - 1];
-      console.warn(`⚠️ [BACKEND-RETRY] ${label} attempt ${attempt}/${BACKEND_RETRY_ATTEMPTS} failed: ${error.message}. Retrying in ${delayMs / 1000}s...`);
+      const retryAfterMs = parseRetryAfterMs(error);
+      const defaultDelayMs = BACKEND_RETRY_DELAYS_MS[attempt - 1];
+      const delayMs = retryAfterMs != null ? retryAfterMs : defaultDelayMs;
+      const reason = retryAfterMs != null ? `(Retry-After: ${Math.round(retryAfterMs / 1000)}s)` : '';
+      console.warn(`⚠️ [BACKEND-RETRY] ${label} attempt ${attempt}/${BACKEND_RETRY_ATTEMPTS} failed: ${error.message} ${reason}. Retrying in ${Math.round(delayMs / 1000)}s...`);
       await new Promise(resolve => setTimeout(resolve, delayMs));
     }
   }
