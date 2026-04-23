@@ -134,11 +134,22 @@ function findContainerByName(containers, requestedName) {
 }
 
 /** After `container.start()`, poll state for this long before treating a non-zero exit as immediate failure (cold start / post-deploy). */
-const CRAWLER_IMMEDIATE_EXIT_GRACE_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_GRACE_MS || '28000', 10);
+const CRAWLER_IMMEDIATE_EXIT_GRACE_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_GRACE_MS || '32000', 10);
 const CRAWLER_IMMEDIATE_EXIT_POLL_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_POLL_MS || '500', 10);
 /** When the crawler exits during the startup grace window, retry create/start (ALB/ECS churn, cold image, brief daemon flakes). */
-const CRAWLER_CONTAINER_START_ATTEMPTS = Math.max(1, parseInt(process.env.CRAWLER_CONTAINER_START_ATTEMPTS || '12', 10));
-const CRAWLER_CONTAINER_START_RETRY_BASE_MS = Math.max(0, parseInt(process.env.CRAWLER_CONTAINER_START_RETRY_BASE_MS || '4000', 10));
+const CRAWLER_CONTAINER_START_ATTEMPTS = Math.max(1, parseInt(process.env.CRAWLER_CONTAINER_START_ATTEMPTS || '14', 10));
+const CRAWLER_CONTAINER_START_RETRY_BASE_MS = Math.max(0, parseInt(process.env.CRAWLER_CONTAINER_START_RETRY_BASE_MS || '4500', 10));
+/** Extra random delay per retry so many helpers do not thundering-herd the API right after multi-service deploys. */
+const CRAWLER_CONTAINER_START_RETRY_JITTER_MS = Math.max(0, parseInt(process.env.CRAWLER_CONTAINER_START_RETRY_JITTER_MS || '2000', 10));
+
+function delayMsWithStartupJitter(startAttempt) {
+  const base = CRAWLER_CONTAINER_START_RETRY_BASE_MS * startAttempt;
+  const jitter =
+    CRAWLER_CONTAINER_START_RETRY_JITTER_MS > 0
+      ? Math.floor(Math.random() * (CRAWLER_CONTAINER_START_RETRY_JITTER_MS + 1))
+      : 0;
+  return base + jitter;
+}
 
 /**
  * Heuristic: failures likely to succeed on a fresh container start (post-deploy race),
@@ -156,7 +167,7 @@ function isTransientCrawlerStartupExit({ exitCode, oom, logTail }) {
   if (t.includes('err_module_not_found')) return false;
   // Short-lived API/ALB/edge and DNS issues while GitHub/ECS deploys roll (ALB target churn, route53/cache, IPv6 flaps).
   const networkChurn =
-    /econnrefused|econnreset|etimedout|socket hang up|connect timeout|bad gateway|service unavailable|gateway time-out|eai_again|getaddrinfo|enotfound|enetworkunreachable|enetunreach|enetworkdown|etxtbsy|tls connection|ssl routines|\b502\b|\b503\b|\b504\b/.test(
+    /econnrefused|econnreset|etimedout|socket hang up|connect timeout|bad gateway|service unavailable|gateway time-out|eai_again|getaddrinfo|enotfound|enetworkunreachable|enetunreach|enetworkdown|etxtbsy|tls connection|ssl routines|\b429\b|\b502\b|\b503\b|\b504\b/.test(
       t
     );
   if (networkChurn && (code === 1 || code === 2 || code === 134)) return true;
@@ -1134,9 +1145,9 @@ async function startCrawlerContainer(job) {
 
         const transient = isTransientCrawlerStartupExit({ exitCode: exitCodeForLogic, oom, logTail });
         if (transient && startAttempt < CRAWLER_CONTAINER_START_ATTEMPTS) {
-          const delayMs = CRAWLER_CONTAINER_START_RETRY_BASE_MS * startAttempt;
+          const delayMs = delayMsWithStartupJitter(startAttempt);
           console.warn(
-            `♻️ Crawler startup failed (attempt ${startAttempt}/${CRAWLER_CONTAINER_START_ATTEMPTS}); retrying in ${delayMs}ms`
+            `♻️ Crawler startup failed (attempt ${startAttempt}/${CRAWLER_CONTAINER_START_ATTEMPTS}); retrying in ${delayMs}ms (base backoff + jitter)`
           );
           await new Promise((r) => setTimeout(r, delayMs));
           continue;
@@ -1158,9 +1169,9 @@ async function startCrawlerContainer(job) {
           console.warn(`⚠️ Failed to remove stalled container: ${removeError.message}`);
         }
         if (startAttempt < CRAWLER_CONTAINER_START_ATTEMPTS) {
-          const delayMs = CRAWLER_CONTAINER_START_RETRY_BASE_MS * startAttempt;
+          const delayMs = delayMsWithStartupJitter(startAttempt);
           console.warn(
-            `♻️ Crawler startup stalled (attempt ${startAttempt}/${CRAWLER_CONTAINER_START_ATTEMPTS}); retrying in ${delayMs}ms`
+            `♻️ Crawler startup stalled (attempt ${startAttempt}/${CRAWLER_CONTAINER_START_ATTEMPTS}); retrying in ${delayMs}ms (base backoff + jitter)`
           );
           await new Promise((r) => setTimeout(r, delayMs));
           continue;
