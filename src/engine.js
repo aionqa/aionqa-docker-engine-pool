@@ -133,6 +133,59 @@ function findContainerByName(containers, requestedName) {
   ) || null;
 }
 
+/** After `container.start()`, poll state for this long before treating a non-zero exit as immediate failure (cold start / post-deploy). */
+const CRAWLER_IMMEDIATE_EXIT_GRACE_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_GRACE_MS || '8000', 10);
+const CRAWLER_IMMEDIATE_EXIT_POLL_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_POLL_MS || '500', 10);
+
+/**
+ * Decode Docker multiplexed log stream (8-byte header per chunk) to UTF-8 text.
+ * @param {Buffer} buffer
+ * @returns {string}
+ */
+function decodeDockerLogsBuffer(buffer) {
+  if (!buffer || buffer.length === 0) return '';
+  const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+  let out = '';
+  let pos = 0;
+  while (pos + 8 <= buf.length) {
+    const size = buf.readUInt32BE(pos + 4);
+    if (!Number.isFinite(size) || size < 0 || pos + 8 + size > buf.length) break;
+    out += buf.subarray(pos + 8, pos + 8 + size).toString('utf8');
+    pos += 8 + size;
+  }
+  const trimmed = out.trim();
+  if (trimmed) return out;
+  return buf.toString('utf8');
+}
+
+async function fetchCrawlerContainerLogTail(container, tailLines = 80) {
+  try {
+    const raw = await container.logs({ stdout: true, stderr: true, tail: tailLines, timestamps: false });
+    const text = decodeDockerLogsBuffer(raw);
+    const max = 4000;
+    return text.length > max ? `${text.slice(-max)}\n…(truncated)` : text;
+  } catch (e) {
+    return `(logs unavailable: ${e.message || e})`;
+  }
+}
+
+/**
+ * Poll until the crawler container is running, exits, or grace elapses.
+ * @returns {Promise<object>} Last `docker inspect` JSON
+ */
+async function waitForCrawlerStartupOrExit(container) {
+  const deadline = Date.now() + Math.max(1000, CRAWLER_IMMEDIATE_EXIT_GRACE_MS);
+  let last = await container.inspect();
+  while (Date.now() < deadline) {
+    last = await container.inspect();
+    const st = last.State?.Status;
+    if (st === 'running' || st === 'restarting') return last;
+    if (st === 'exited' || st === 'dead') return last;
+    await new Promise((r) => setTimeout(r, CRAWLER_IMMEDIATE_EXIT_POLL_MS));
+  }
+  return container.inspect();
+}
+
 /** Backend retry delays: 10s, 30s, 3min. Runners continue without interruption when backend restarts; only admin explicit cleanup clears state. */
 const BACKEND_RETRY_DELAYS_MS = [10 * 1000, 30 * 1000, 3 * 60 * 1000];
 const BACKEND_RETRY_ATTEMPTS = 1 + BACKEND_RETRY_DELAYS_MS.length; // 4 total
@@ -990,21 +1043,43 @@ async function startCrawlerContainer(job) {
     await container.start();
     console.log(`✅ Container started: ${container.id.substring(0, 12)}`);
 
-    // Wait a moment and check if container is still running
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    const containerInfo = await container.inspect();
-    if (containerInfo.State.Status === 'exited') {
+    // Grace window: Node + Playwright import can exceed 1s on busy hosts; post-deploy cold starts are common.
+    const containerInfo = await waitForCrawlerStartupOrExit(container);
+    if (containerInfo.State.Status === 'exited' || containerInfo.State.Status === 'dead') {
       const exitCode = containerInfo.State.ExitCode;
-      const error = containerInfo.State.Error || 'Unknown error';
-      console.error(`❌ Container exited immediately with code ${exitCode}: ${error}`);
-      
+      const oom = !!containerInfo.State.OOMKilled;
+      const daemonErrRaw = containerInfo.State.Error != null ? String(containerInfo.State.Error).trim() : '';
+      const finishedAt = containerInfo.State.FinishedAt || '';
+
+      // Match unified-crawler single-job mode: runner may exit 0 after reporting failure so Docker exit code
+      // does not overwrite an already-reported job outcome. Treat as started; completion path notifies backend.
+      if (exitCode === 0) {
+        console.warn(
+          `ℹ️ Container ${container.id.substring(0, 12)} exited with code 0 during startup grace (finishedAt=${finishedAt}); attaching monitor for terminal notify`
+        );
+        runningContainers.set(container.id, job_id);
+        processingJobs.delete(job_id);
+        monitorContainer(container, job_id);
+        return container.id;
+      }
+
+      const logTail = await fetchCrawlerContainerLogTail(container, 100);
+      const detailParts = [
+        `exitCode=${exitCode}`,
+        oom ? 'OOMKilled=true' : null,
+        daemonErrRaw ? `daemonError=${daemonErrRaw}` : null,
+        finishedAt ? `finishedAt=${finishedAt}` : null,
+        logTail ? `logTail=${logTail}` : null
+      ].filter(Boolean);
+      const detail = detailParts.length ? detailParts.join('; ') : 'Unknown error';
+      console.error(`❌ Container exited during startup grace: ${detail}`);
+      console.error(`❌ (legacy summary) Container exited immediately with code ${exitCode}: ${daemonErrRaw || 'Unknown error'}`);
+
       // Remove from processing set on error
       processingJobs.delete(job_id);
-      
-      // Try to get container logs
+
       try {
-        const logs = await container.logs({ stdout: true, stderr: true, tail: 50 });
-        console.error(`Container logs:`, logs.toString());
+        console.error(`Container logs (decoded tail):`, logTail);
       } catch (logError) {
         const msg = logError.message || '';
         if (msg.includes('does not support reading')) {
@@ -1022,7 +1097,7 @@ async function startCrawlerContainer(job) {
         console.warn(`⚠️ Failed to remove container: ${removeError.message}`);
       }
 
-      throw new Error(`Container exited immediately with code ${exitCode}: ${error}`);
+      throw new Error(`Container exited immediately with code ${exitCode}: ${detail}`);
     }
 
     // Track container
