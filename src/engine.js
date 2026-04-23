@@ -168,7 +168,10 @@ function isTransientCrawlerStartupExit({ exitCode, oom, logTail }) {
   // OOM during cold parallel starts or cgroup quirks sometimes reports non-137 exit codes; caller caps retries.
   if (oom) return true;
   const t = (logTail || '').toLowerCase();
-  if (t.includes('runner_token') && t.includes('required')) return false;
+  // Only the crawler bootstrap "missing env" line is a confident non-retry. A broad
+  // `runner_token` + `required` match can hit unrelated JSON/API bodies and block all
+  // CRAWLER_CONTAINER_START_ATTEMPTS (seen as fast job failure with exit 1, no pages).
+  if (t.includes('runner_token environment variable is required')) return false;
   if (t.includes('cannot find module')) return false;
   if (t.includes('syntaxerror')) return false;
   if (t.includes('err_module_not_found')) return false;
