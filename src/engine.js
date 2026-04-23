@@ -137,7 +137,7 @@ function findContainerByName(containers, requestedName) {
 const CRAWLER_IMMEDIATE_EXIT_GRACE_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_GRACE_MS || '40000', 10);
 const CRAWLER_IMMEDIATE_EXIT_POLL_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_POLL_MS || '500', 10);
 /** Brief sleep after `start()` before polling — reduces false "exited" reads during Dockerd/ALB churn right after multi-service deploys. */
-const CRAWLER_POST_START_STABILIZE_MS = Math.max(0, parseInt(process.env.CRAWLER_POST_START_STABILIZE_MS || '450', 10));
+const CRAWLER_POST_START_STABILIZE_MS = Math.max(0, parseInt(process.env.CRAWLER_POST_START_STABILIZE_MS || '750', 10));
 /**
  * When the container already looks `exited` with a transient-class code but log tail is still empty/short,
  * wait and `inspect()` once more before teardown. json-file logs can lag; daemons sometimes report exit before the process fully settles.
@@ -174,7 +174,7 @@ function isTransientCrawlerStartupExit({ exitCode, oom, logTail }) {
   if (t.includes('err_module_not_found')) return false;
   // Short-lived API/ALB/edge and DNS issues while GitHub/ECS deploys roll (ALB target churn, route53/cache, IPv6 flaps).
   const networkChurn =
-    /econnrefused|econnreset|etimedout|socket hang up|connect timeout|bad gateway|service unavailable|gateway time-out|eai_again|getaddrinfo|enotfound|enetworkunreachable|enetunreach|enetworkdown|etxtbsy|tls connection|ssl routines|\b429\b|\b502\b|\b503\b|\b504\b/.test(
+    /econnrefused|econnreset|etimedout|socket hang up|connect timeout|bad gateway|service unavailable|gateway time-out|eai_again|getaddrinfo|enotfound|enetworkunreachable|enetunreach|enetworkdown|etxtbsy|tls connection|ssl routines|\b429\b|\b502\b|\b503\b|\b504\b|\b524\b/.test(
       t
     );
   if (networkChurn && (code === 1 || code === 2 || code === 134)) return true;
@@ -222,12 +222,26 @@ async function fetchCrawlerContainerLogTail(container, tailLines = 80) {
  * are not opaque "Unknown error" when the daemon state is otherwise empty.
  */
 async function fetchCrawlerContainerLogTailForDiagnostics(container, tailLines = 120) {
-  const first = await fetchCrawlerContainerLogTail(container, tailLines);
-  const t0 = String(first || '').trim().length;
-  if (t0 >= CRAWLER_EXIT_LOG_DEBOUNCE_MIN_CHARS) return first;
-  await new Promise((r) => setTimeout(r, 450));
-  const wider = await fetchCrawlerContainerLogTail(container, Math.max(tailLines, 220));
-  return String(wider || '').trim().length >= t0 ? wider : first;
+  let best = await fetchCrawlerContainerLogTail(container, tailLines);
+  let bestLen = String(best || '').trim().length;
+  if (bestLen >= CRAWLER_EXIT_LOG_DEBOUNCE_MIN_CHARS) return best;
+
+  const rounds = [
+    { waitMs: 450, tail: Math.max(tailLines, 220) },
+    { waitMs: 1200, tail: Math.max(tailLines, 400) },
+    { waitMs: 2500, tail: Math.max(tailLines, 600) }
+  ];
+  for (const { waitMs, tail } of rounds) {
+    await new Promise((r) => setTimeout(r, waitMs));
+    const next = await fetchCrawlerContainerLogTail(container, tail);
+    const nLen = String(next || '').trim().length;
+    if (nLen > bestLen) {
+      best = next;
+      bestLen = nLen;
+    }
+    if (bestLen >= CRAWLER_EXIT_LOG_DEBOUNCE_MIN_CHARS) return best;
+  }
+  return best;
 }
 
 /**
