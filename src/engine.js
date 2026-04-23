@@ -134,10 +134,18 @@ function findContainerByName(containers, requestedName) {
 }
 
 /** After `container.start()`, poll state for this long before treating a non-zero exit as immediate failure (cold start / post-deploy). */
-const CRAWLER_IMMEDIATE_EXIT_GRACE_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_GRACE_MS || '32000', 10);
+const CRAWLER_IMMEDIATE_EXIT_GRACE_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_GRACE_MS || '40000', 10);
 const CRAWLER_IMMEDIATE_EXIT_POLL_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_POLL_MS || '500', 10);
+/** Brief sleep after `start()` before polling — reduces false "exited" reads during Dockerd/ALB churn right after multi-service deploys. */
+const CRAWLER_POST_START_STABILIZE_MS = Math.max(0, parseInt(process.env.CRAWLER_POST_START_STABILIZE_MS || '450', 10));
+/**
+ * When the container already looks `exited` with a transient-class code but log tail is still empty/short,
+ * wait and `inspect()` once more before teardown. json-file logs can lag; daemons sometimes report exit before the process fully settles.
+ */
+const CRAWLER_EXIT_LOG_DEBOUNCE_MS = Math.max(0, parseInt(process.env.CRAWLER_EXIT_LOG_DEBOUNCE_MS || '2200', 10));
+const CRAWLER_EXIT_LOG_DEBOUNCE_MIN_CHARS = Math.max(0, parseInt(process.env.CRAWLER_EXIT_LOG_DEBOUNCE_MIN_CHARS || '40', 10));
 /** When the crawler exits during the startup grace window, retry create/start (ALB/ECS churn, cold image, brief daemon flakes). */
-const CRAWLER_CONTAINER_START_ATTEMPTS = Math.max(1, parseInt(process.env.CRAWLER_CONTAINER_START_ATTEMPTS || '14', 10));
+const CRAWLER_CONTAINER_START_ATTEMPTS = Math.max(1, parseInt(process.env.CRAWLER_CONTAINER_START_ATTEMPTS || '16', 10));
 const CRAWLER_CONTAINER_START_RETRY_BASE_MS = Math.max(0, parseInt(process.env.CRAWLER_CONTAINER_START_RETRY_BASE_MS || '4500', 10));
 /** Extra random delay per retry so many helpers do not thundering-herd the API right after multi-service deploys. */
 const CRAWLER_CONTAINER_START_RETRY_JITTER_MS = Math.max(0, parseInt(process.env.CRAWLER_CONTAINER_START_RETRY_JITTER_MS || '2000', 10));
@@ -1090,8 +1098,34 @@ async function startCrawlerContainer(job) {
         `✅ Container started: ${container.id.substring(0, 12)} (start attempt ${startAttempt}/${CRAWLER_CONTAINER_START_ATTEMPTS})`
       );
 
+      if (CRAWLER_POST_START_STABILIZE_MS > 0) {
+        await new Promise((r) => setTimeout(r, CRAWLER_POST_START_STABILIZE_MS));
+      }
+
       // Grace window: Node + Playwright import can exceed 1s on busy hosts; post-deploy cold starts are common.
-      const containerInfo = await waitForCrawlerStartupOrExit(container);
+      let containerInfo = await waitForCrawlerStartupOrExit(container);
+
+      // Sparse-log debounce: avoid tearing down a healthy container when Docker reports exit before logs/state catch up (common during ECS/ALB roll).
+      if (
+        CRAWLER_EXIT_LOG_DEBOUNCE_MS > 0 &&
+        (containerInfo.State?.Status === 'exited' || containerInfo.State?.Status === 'dead')
+      ) {
+        const ec0 = Number(containerInfo.State.ExitCode);
+        const ecLogic0 = Number.isFinite(ec0) ? ec0 : -1;
+        const oom0 = !!containerInfo.State.OOMKilled;
+        const log0 = await fetchCrawlerContainerLogTail(container, 100);
+        const sparse =
+          !log0 ||
+          String(log0).trim().length < CRAWLER_EXIT_LOG_DEBOUNCE_MIN_CHARS;
+        if (sparse && isTransientCrawlerStartupExit({ exitCode: ecLogic0, oom: oom0, logTail: log0 })) {
+          console.warn(
+            `⏳ Sparse crawler logs on early exit (code=${ecLogic0}); debouncing ${CRAWLER_EXIT_LOG_DEBOUNCE_MS}ms then re-inspecting`
+          );
+          await new Promise((r) => setTimeout(r, CRAWLER_EXIT_LOG_DEBOUNCE_MS));
+          containerInfo = await container.inspect();
+        }
+      }
+
       const lifecycleStatus = containerInfo.State?.Status || '';
       if (lifecycleStatus === 'exited' || lifecycleStatus === 'dead') {
         const exitCode = Number(containerInfo.State.ExitCode);
