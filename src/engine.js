@@ -1325,10 +1325,23 @@ async function monitorContainer(container, jobId) {
 
     console.log(`📦 Container ${container.id.substring(0, 12)} exited with code ${exitCode} for job ${jobId}`);
 
+    let logTail = '';
+    if (exitCode !== 0) {
+      try {
+        logTail = await fetchCrawlerContainerLogTailForDiagnostics(container, 120);
+      } catch (e) {
+        logTail = `(log tail unavailable: ${e.message || e})`;
+      }
+    }
+
     try {
       await withBackendRetry(() => axios.post(
         `${BACKEND_URL}/api/docker-engines/${ENGINE_ID}/jobs/${jobId}/completed`,
-        { container_id: container.id, exit_code: exitCode },
+        {
+          container_id: container.id,
+          exit_code: exitCode,
+          ...(logTail && String(logTail).trim() ? { log_tail: String(logTail) } : {})
+        },
         { headers: getAuthHeaders() }
       ), `jobs/${jobId}/completed`);
     } catch (error) {
