@@ -134,10 +134,10 @@ function findContainerByName(containers, requestedName) {
 }
 
 /** After `container.start()`, poll state for this long before treating a non-zero exit as immediate failure (cold start / post-deploy). */
-const CRAWLER_IMMEDIATE_EXIT_GRACE_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_GRACE_MS || '12000', 10);
+const CRAWLER_IMMEDIATE_EXIT_GRACE_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_GRACE_MS || '20000', 10);
 const CRAWLER_IMMEDIATE_EXIT_POLL_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_POLL_MS || '500', 10);
 /** When the crawler exits during the startup grace window, retry create/start (ALB/ECS churn, cold image, brief daemon flakes). */
-const CRAWLER_CONTAINER_START_ATTEMPTS = Math.max(1, parseInt(process.env.CRAWLER_CONTAINER_START_ATTEMPTS || '3', 10));
+const CRAWLER_CONTAINER_START_ATTEMPTS = Math.max(1, parseInt(process.env.CRAWLER_CONTAINER_START_ATTEMPTS || '5', 10));
 const CRAWLER_CONTAINER_START_RETRY_BASE_MS = Math.max(0, parseInt(process.env.CRAWLER_CONTAINER_START_RETRY_BASE_MS || '2500', 10));
 
 /**
