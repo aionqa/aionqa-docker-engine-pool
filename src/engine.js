@@ -137,8 +137,8 @@ function findContainerByName(containers, requestedName) {
 const CRAWLER_IMMEDIATE_EXIT_GRACE_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_GRACE_MS || '28000', 10);
 const CRAWLER_IMMEDIATE_EXIT_POLL_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_POLL_MS || '500', 10);
 /** When the crawler exits during the startup grace window, retry create/start (ALB/ECS churn, cold image, brief daemon flakes). */
-const CRAWLER_CONTAINER_START_ATTEMPTS = Math.max(1, parseInt(process.env.CRAWLER_CONTAINER_START_ATTEMPTS || '7', 10));
-const CRAWLER_CONTAINER_START_RETRY_BASE_MS = Math.max(0, parseInt(process.env.CRAWLER_CONTAINER_START_RETRY_BASE_MS || '2500', 10));
+const CRAWLER_CONTAINER_START_ATTEMPTS = Math.max(1, parseInt(process.env.CRAWLER_CONTAINER_START_ATTEMPTS || '10', 10));
+const CRAWLER_CONTAINER_START_RETRY_BASE_MS = Math.max(0, parseInt(process.env.CRAWLER_CONTAINER_START_RETRY_BASE_MS || '4000', 10));
 
 /**
  * Heuristic: failures likely to succeed on a fresh container start (post-deploy race),
@@ -154,8 +154,14 @@ function isTransientCrawlerStartupExit({ exitCode, oom, logTail }) {
   if (t.includes('cannot find module')) return false;
   if (t.includes('syntaxerror')) return false;
   if (t.includes('err_module_not_found')) return false;
+  // Short-lived API/ALB/edge issues while GitHub/ECS deploys roll (see collected deploy-window evidence on self-monitor failures).
+  const networkChurn =
+    /econnrefused|econnreset|etimedout|socket hang up|connect timeout|bad gateway|service unavailable|gateway time-out|\b502\b|\b503\b|\b504\b/.test(
+      t
+    );
+  if (networkChurn && (code === 1 || code === 2 || code === 134)) return true;
   // Common crash codes during resource pressure / browser init; worth one or two fresh attempts.
-  return code === 1 || code === 134 || code === 137 || code === 139;
+  return code === 1 || code === 2 || code === 134 || code === 137 || code === 139;
 }
 
 /**
