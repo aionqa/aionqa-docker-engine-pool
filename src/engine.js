@@ -134,8 +134,26 @@ function findContainerByName(containers, requestedName) {
 }
 
 /** After `container.start()`, poll state for this long before treating a non-zero exit as immediate failure (cold start / post-deploy). */
-const CRAWLER_IMMEDIATE_EXIT_GRACE_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_GRACE_MS || '8000', 10);
+const CRAWLER_IMMEDIATE_EXIT_GRACE_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_GRACE_MS || '12000', 10);
 const CRAWLER_IMMEDIATE_EXIT_POLL_MS = parseInt(process.env.CRAWLER_IMMEDIATE_EXIT_POLL_MS || '500', 10);
+/** When the crawler exits during the startup grace window, retry create/start (ALB/ECS churn, cold image, brief daemon flakes). */
+const CRAWLER_CONTAINER_START_ATTEMPTS = Math.max(1, parseInt(process.env.CRAWLER_CONTAINER_START_ATTEMPTS || '3', 10));
+const CRAWLER_CONTAINER_START_RETRY_BASE_MS = Math.max(0, parseInt(process.env.CRAWLER_CONTAINER_START_RETRY_BASE_MS || '2500', 10));
+
+/**
+ * Heuristic: failures likely to succeed on a fresh container start (post-deploy race),
+ * vs. permanent misconfig (missing token) or code errors we should not spin on.
+ */
+function isTransientCrawlerStartupExit({ exitCode, oom, logTail }) {
+  if (oom) return false;
+  const t = (logTail || '').toLowerCase();
+  if (t.includes('runner_token') && t.includes('required')) return false;
+  if (t.includes('cannot find module')) return false;
+  if (t.includes('syntaxerror')) return false;
+  if (t.includes('err_module_not_found')) return false;
+  // Common crash codes during resource pressure / browser init; worth one or two fresh attempts.
+  return exitCode === 1 || exitCode === 134 || exitCode === 137 || exitCode === 139;
+}
 
 /**
  * Decode Docker multiplexed log stream (8-byte header per chunk) to UTF-8 text.
@@ -1003,101 +1021,117 @@ async function startCrawlerContainer(job) {
       ? `aionqa-crawler-runner-${sanitizeRunnerName(RUNNER_NAME)}`
       : `aionqa-crawler-job-${job_id}`;
 
-    // Replace existing container with same name if present (named runner: replace previous; per-job: clean stale).
-    try {
-      const existingContainer = docker.getContainer(containerName);
-      const containerInfo = await existingContainer.inspect();
-      if (containerInfo) {
-        console.log(`🧹 Replacing existing container: ${containerName}`);
+    let container;
+    for (let startAttempt = 1; startAttempt <= CRAWLER_CONTAINER_START_ATTEMPTS; startAttempt++) {
+      // Replace existing container with same name if present (named runner: replace previous; per-job: clean stale).
+      try {
+        const existingContainer = docker.getContainer(containerName);
+        const existingInfo = await existingContainer.inspect();
+        if (existingInfo) {
+          console.log(`🧹 Replacing existing container: ${containerName}`);
+          try {
+            await existingContainer.stop();
+          } catch (stopError) {
+            // Container might already be stopped, ignore
+          }
+          await existingContainer.remove({ force: true, v: true });
+          console.log(`✅ Removed existing container: ${containerName}`);
+        }
+      } catch (notFoundError) {
+        // Container doesn't exist, that's fine - continue
+      }
+
+      container = await docker.createContainer({
+        Image: image_url,
+        name: containerName, // Use consistent naming pattern
+        Env: containerEnv,
+        HostConfig: {
+          ShmSize: 2147483648, // 2GB for Chromium
+          NetworkMode: (helperConfig && helperConfig.crawler_network) || process.env.CRAWLER_NETWORK || 'aionqa-network',
+          AutoRemove: false, // Helper removes containers when not running (see monitorContainer + cleanupContainers)
+          RestartPolicy: { Name: 'no' }, // Don't restart
+          Binds: ['/var/run/docker.sock:/var/run/docker.sock'], // Mount docker socket for video recording
+          LogConfig: LOG_CONFIG_JSON_FILE
+        },
+        Labels: {
+          'aionqa.job_id': job_id,
+          'aionqa.engine_id': ENGINE_ID
+        }
+      });
+
+      // Start container
+      await container.start();
+      console.log(
+        `✅ Container started: ${container.id.substring(0, 12)} (start attempt ${startAttempt}/${CRAWLER_CONTAINER_START_ATTEMPTS})`
+      );
+
+      // Grace window: Node + Playwright import can exceed 1s on busy hosts; post-deploy cold starts are common.
+      const containerInfo = await waitForCrawlerStartupOrExit(container);
+      if (containerInfo.State.Status === 'exited' || containerInfo.State.Status === 'dead') {
+        const exitCode = containerInfo.State.ExitCode;
+        const oom = !!containerInfo.State.OOMKilled;
+        const daemonErrRaw = containerInfo.State.Error != null ? String(containerInfo.State.Error).trim() : '';
+        const finishedAt = containerInfo.State.FinishedAt || '';
+
+        // Match unified-crawler single-job mode: runner may exit 0 after reporting failure so Docker exit code
+        // does not overwrite an already-reported job outcome. Treat as started; completion path notifies backend.
+        if (exitCode === 0) {
+          console.warn(
+            `ℹ️ Container ${container.id.substring(0, 12)} exited with code 0 during startup grace (finishedAt=${finishedAt}); attaching monitor for terminal notify`
+          );
+          runningContainers.set(container.id, job_id);
+          processingJobs.delete(job_id);
+          monitorContainer(container, job_id);
+          return container.id;
+        }
+
+        const logTail = await fetchCrawlerContainerLogTail(container, 100);
+        const detailParts = [
+          `exitCode=${exitCode}`,
+          oom ? 'OOMKilled=true' : null,
+          daemonErrRaw ? `daemonError=${daemonErrRaw}` : null,
+          finishedAt ? `finishedAt=${finishedAt}` : null,
+          logTail ? `logTail=${logTail}` : null
+        ].filter(Boolean);
+        const detail = detailParts.length ? detailParts.join('; ') : 'Unknown error';
+        console.error(`❌ Container exited during startup grace: ${detail}`);
+        console.error(`❌ (legacy summary) Container exited immediately with code ${exitCode}: ${daemonErrRaw || 'Unknown error'}`);
+
         try {
-          await existingContainer.stop();
-        } catch (stopError) {
-          // Container might already be stopped, ignore
+          console.error(`Container logs (decoded tail):`, logTail);
+        } catch (logError) {
+          const msg = logError.message || '';
+          if (msg.includes('does not support reading')) {
+            console.error(`Container logs unavailable (daemon log driver does not support reading). Ensure containers use json-file log driver.`);
+          } else {
+            console.error(`Failed to get container logs:`, msg);
+          }
         }
-        await existingContainer.remove({ force: true, v: true });
-        console.log(`✅ Removed existing container: ${containerName}`);
-      }
-    } catch (notFoundError) {
-      // Container doesn't exist, that's fine - continue
-    }
 
-    const container = await docker.createContainer({
-      Image: image_url,
-      name: containerName, // Use consistent naming pattern
-      Env: containerEnv,
-      HostConfig: {
-        ShmSize: 2147483648, // 2GB for Chromium
-        NetworkMode: (helperConfig && helperConfig.crawler_network) || process.env.CRAWLER_NETWORK || 'aionqa-network',
-        AutoRemove: false, // Helper removes containers when not running (see monitorContainer + cleanupContainers)
-        RestartPolicy: { Name: 'no' }, // Don't restart
-        Binds: ['/var/run/docker.sock:/var/run/docker.sock'], // Mount docker socket for video recording
-        LogConfig: LOG_CONFIG_JSON_FILE
-      },
-      Labels: {
-        'aionqa.job_id': job_id,
-        'aionqa.engine_id': ENGINE_ID
-      }
-    });
+        // Remove container so it does not stay on the host (force + volumes for isolation)
+        try {
+          await container.remove({ force: true, v: true });
+          console.log(`🧹 Removed failed container ${containerName}`);
+        } catch (removeError) {
+          console.warn(`⚠️ Failed to remove container: ${removeError.message}`);
+        }
 
-    // Start container
-    await container.start();
-    console.log(`✅ Container started: ${container.id.substring(0, 12)}`);
+        const transient = isTransientCrawlerStartupExit({ exitCode, oom, logTail });
+        if (transient && startAttempt < CRAWLER_CONTAINER_START_ATTEMPTS) {
+          const delayMs = CRAWLER_CONTAINER_START_RETRY_BASE_MS * startAttempt;
+          console.warn(
+            `♻️ Crawler startup failed (attempt ${startAttempt}/${CRAWLER_CONTAINER_START_ATTEMPTS}); retrying in ${delayMs}ms`
+          );
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
 
-    // Grace window: Node + Playwright import can exceed 1s on busy hosts; post-deploy cold starts are common.
-    const containerInfo = await waitForCrawlerStartupOrExit(container);
-    if (containerInfo.State.Status === 'exited' || containerInfo.State.Status === 'dead') {
-      const exitCode = containerInfo.State.ExitCode;
-      const oom = !!containerInfo.State.OOMKilled;
-      const daemonErrRaw = containerInfo.State.Error != null ? String(containerInfo.State.Error).trim() : '';
-      const finishedAt = containerInfo.State.FinishedAt || '';
-
-      // Match unified-crawler single-job mode: runner may exit 0 after reporting failure so Docker exit code
-      // does not overwrite an already-reported job outcome. Treat as started; completion path notifies backend.
-      if (exitCode === 0) {
-        console.warn(
-          `ℹ️ Container ${container.id.substring(0, 12)} exited with code 0 during startup grace (finishedAt=${finishedAt}); attaching monitor for terminal notify`
-        );
-        runningContainers.set(container.id, job_id);
         processingJobs.delete(job_id);
-        monitorContainer(container, job_id);
-        return container.id;
+        throw new Error(`Container exited immediately with code ${exitCode}: ${detail}`);
       }
 
-      const logTail = await fetchCrawlerContainerLogTail(container, 100);
-      const detailParts = [
-        `exitCode=${exitCode}`,
-        oom ? 'OOMKilled=true' : null,
-        daemonErrRaw ? `daemonError=${daemonErrRaw}` : null,
-        finishedAt ? `finishedAt=${finishedAt}` : null,
-        logTail ? `logTail=${logTail}` : null
-      ].filter(Boolean);
-      const detail = detailParts.length ? detailParts.join('; ') : 'Unknown error';
-      console.error(`❌ Container exited during startup grace: ${detail}`);
-      console.error(`❌ (legacy summary) Container exited immediately with code ${exitCode}: ${daemonErrRaw || 'Unknown error'}`);
-
-      // Remove from processing set on error
-      processingJobs.delete(job_id);
-
-      try {
-        console.error(`Container logs (decoded tail):`, logTail);
-      } catch (logError) {
-        const msg = logError.message || '';
-        if (msg.includes('does not support reading')) {
-          console.error(`Container logs unavailable (daemon log driver does not support reading). Ensure containers use json-file log driver.`);
-        } else {
-          console.error(`Failed to get container logs:`, msg);
-        }
-      }
-
-      // Remove container so it does not stay on the host (force + volumes for isolation)
-      try {
-        await container.remove({ force: true, v: true });
-        console.log(`🧹 Removed failed container ${containerName}`);
-      } catch (removeError) {
-        console.warn(`⚠️ Failed to remove container: ${removeError.message}`);
-      }
-
-      throw new Error(`Container exited immediately with code ${exitCode}: ${detail}`);
+      // Still running (or restarting) after grace — proceed to monitor path
+      break;
     }
 
     // Track container
