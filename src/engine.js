@@ -165,9 +165,8 @@ function delayMsWithStartupJitter(startAttempt) {
  */
 function isTransientCrawlerStartupExit({ exitCode, oom, logTail }) {
   const code = Number(exitCode);
-  // Brief OOM during cold parallel starts sometimes clears on a fresh attempt; cap retries via caller attempts.
-  if (oom && code === 137) return true;
-  if (oom) return false;
+  // OOM during cold parallel starts or cgroup quirks sometimes reports non-137 exit codes; caller caps retries.
+  if (oom) return true;
   const t = (logTail || '').toLowerCase();
   if (t.includes('runner_token') && t.includes('required')) return false;
   if (t.includes('cannot find module')) return false;
@@ -179,6 +178,8 @@ function isTransientCrawlerStartupExit({ exitCode, oom, logTail }) {
       t
     );
   if (networkChurn && (code === 1 || code === 2 || code === 134)) return true;
+  // Indeterminate / wrapper exits seen when Docker reports state before the process fully settles (ALB–ECS churn).
+  if (code === -1 || code === 255) return true;
   // Common crash codes during resource pressure / browser init; worth one or two fresh attempts.
   return code === 1 || code === 2 || code === 134 || code === 137 || code === 139;
 }
@@ -1055,7 +1056,7 @@ async function startCrawlerContainer(job) {
       : `aionqa-crawler-job-${job_id}`;
 
     let container;
-    for (let startAttempt = 1; startAttempt <= CRAWLER_CONTAINER_START_ATTEMPTS; startAttempt++) {
+    crawlerStartAttempts: for (let startAttempt = 1; startAttempt <= CRAWLER_CONTAINER_START_ATTEMPTS; startAttempt++) {
       // Replace existing container with same name if present (named runner: replace previous; per-job: clean stale).
       try {
         const existingContainer = docker.getContainer(containerName);
@@ -1169,6 +1170,31 @@ async function startCrawlerContainer(job) {
           }
         }
 
+        const transient = isTransientCrawlerStartupExit({ exitCode: exitCodeForLogic, oom, logTail });
+        const sparseStartupLogs =
+          !logTail || String(logTail).trim().length < CRAWLER_EXIT_LOG_DEBOUNCE_MIN_CHARS;
+        // Final attempt: json-file tails and Docker state can lag right after multi-service deploys; one more wait before teardown.
+        if (
+          transient &&
+          startAttempt === CRAWLER_CONTAINER_START_ATTEMPTS &&
+          sparseStartupLogs &&
+          CRAWLER_EXIT_LOG_DEBOUNCE_MS > 0
+        ) {
+          console.warn(
+            `⏳ Final startup attempt with sparse logs (exit=${exitCodeForLogic}); debouncing ${CRAWLER_EXIT_LOG_DEBOUNCE_MS}ms then re-inspecting`
+          );
+          await new Promise((r) => setTimeout(r, CRAWLER_EXIT_LOG_DEBOUNCE_MS));
+          const lateInspect = await container.inspect();
+          const stLate = lateInspect.State?.Status || '';
+          if (stLate === 'running' || stLate === 'restarting') {
+            console.warn(
+              `✅ Container ${container.id.substring(0, 12)} reached ${stLate} after final debounce; continuing startup path`
+            );
+            containerInfo = lateInspect;
+            break crawlerStartAttempts;
+          }
+        }
+
         // Remove container so it does not stay on the host (force + volumes for isolation)
         try {
           await container.remove({ force: true, v: true });
@@ -1177,7 +1203,6 @@ async function startCrawlerContainer(job) {
           console.warn(`⚠️ Failed to remove container: ${removeError.message}`);
         }
 
-        const transient = isTransientCrawlerStartupExit({ exitCode: exitCodeForLogic, oom, logTail });
         if (transient && startAttempt < CRAWLER_CONTAINER_START_ATTEMPTS) {
           const delayMs = delayMsWithStartupJitter(startAttempt);
           console.warn(
