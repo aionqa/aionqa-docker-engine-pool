@@ -217,6 +217,20 @@ async function fetchCrawlerContainerLogTail(container, tailLines = 80) {
 }
 
 /**
+ * After an immediate exit, json-file log delivery can lag the first `docker logs` read by a few
+ * hundred ms — a second read captures bootstrap stderr (see unified-crawler runner) so job errors
+ * are not opaque "Unknown error" when the daemon state is otherwise empty.
+ */
+async function fetchCrawlerContainerLogTailForDiagnostics(container, tailLines = 120) {
+  const first = await fetchCrawlerContainerLogTail(container, tailLines);
+  const t0 = String(first || '').trim().length;
+  if (t0 >= CRAWLER_EXIT_LOG_DEBOUNCE_MIN_CHARS) return first;
+  await new Promise((r) => setTimeout(r, 450));
+  const wider = await fetchCrawlerContainerLogTail(container, Math.max(tailLines, 220));
+  return String(wider || '').trim().length >= t0 ? wider : first;
+}
+
+/**
  * Poll until the crawler container is running, exits, or grace elapses.
  * @returns {Promise<object>} Last `docker inspect` JSON
  */
@@ -1147,7 +1161,7 @@ async function startCrawlerContainer(job) {
           return container.id;
         }
 
-        const logTail = await fetchCrawlerContainerLogTail(container, 100);
+        const logTail = await fetchCrawlerContainerLogTailForDiagnostics(container, 120);
         const detailParts = [
           `exitCode=${exitCodeForLogic}`,
           oom ? 'OOMKilled=true' : null,
@@ -1218,7 +1232,7 @@ async function startCrawlerContainer(job) {
 
       if (lifecycleStatus !== 'running' && lifecycleStatus !== 'restarting') {
         // Never left created/paused/etc. within grace — do not attach monitor (would hang or mis-report).
-        const logTail = await fetchCrawlerContainerLogTail(container, 100);
+        const logTail = await fetchCrawlerContainerLogTailForDiagnostics(container, 120);
         const stallDetail = `startupStall=status:${lifecycleStatus || '(empty)'}; graceMs=${CRAWLER_IMMEDIATE_EXIT_GRACE_MS}${logTail ? `; logTail=${logTail}` : ''}`;
         console.error(`❌ Container ${container.id.substring(0, 12)} did not reach running after grace: ${stallDetail}`);
         try {
