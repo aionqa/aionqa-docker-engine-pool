@@ -8,7 +8,8 @@ import axios from 'axios';
 import { getMetricImageFields } from './metricImageFields.js';
 import { hostname, cpus, platform, release, arch, networkInterfaces } from 'os';
 import { randomUUID } from 'crypto';
-import { readFileSync } from 'fs';
+import { readFileSync, mkdirSync, rmSync } from 'fs';
+import nodePath from 'path';
 
 // Default to 'back' service name for docker-compose networks
 // In Docker Compose, services are resolved by service name, not container name
@@ -71,6 +72,157 @@ const docker = new Docker({ socketPath: DOCKER_SOCKET });
 
 /** Monorepo root inside cure: sibling repos (submodules) live here — never default to /app (cure image app dir). */
 const DEFAULT_CURE_WORKSPACE_CONTAINER = '/workspace';
+
+function isCureEphemeralEnabled() {
+  const v = String(process.env.CURE_EPHEMERAL || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+/** Admin-api base URL for cure runner routes (ENGINE_TOKEN / SERVICE_TOKEN auth). */
+function resolveCureAdminApiBaseUrl() {
+  const explicit = String(
+    process.env.HELPER_ADMIN_API_URL || process.env.ADMIN_API_URL || process.env.CURE_BACKEND_URL || '',
+  ).trim();
+  if (explicit) return explicit.replace(/\/$/, '');
+  const def = String(BACKEND_URL || '');
+  if (def.includes('://api.')) return def.replace('://api.', '://admin-api.').replace(/\/$/, '');
+  return 'https://admin-api.aionqa.com';
+}
+
+function ephemeralCureContainerName(requestId) {
+  const id = String(requestId || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_.-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '');
+  if (!id) return null;
+  const base = `cure-${id}`;
+  return base.length > 220 ? base.slice(0, 220) : base;
+}
+
+function extractHostPathFromCureBind(bindStr) {
+  if (!bindStr || typeof bindStr !== 'string') return null;
+  const marker = ':/workspace';
+  const idx = bindStr.indexOf(marker);
+  if (idx <= 0) return null;
+  return bindStr.slice(0, idx);
+}
+
+function getCureServiceEnvWithOneShot(requestId) {
+  const env = getCureServiceEnv();
+  return [...env, 'CURE_ONE_SHOT=1', `CURE_CLAIM_REQUEST_ID=${String(requestId).trim()}`];
+}
+
+async function resolveEphemeralJobWorkspaceBind(requestId) {
+  const rid = String(requestId || '').trim();
+  if (!rid) return null;
+  const baseBind = await resolveCureWorkspaceBindString();
+  const hostRoot = extractHostPathFromCureBind(baseBind);
+  if (!hostRoot) return null;
+  const jobDir = nodePath.join(hostRoot, '_cure_job_workspaces', rid);
+  try {
+    rmSync(jobDir, { recursive: true, force: true });
+    mkdirSync(jobDir, { recursive: true });
+  } catch (err) {
+    console.warn(`⚠️ [CURE-EPHEMERAL] workspace prep failed (${jobDir}): ${err.message}`);
+    return null;
+  }
+  const dest =
+    String(process.env.CURE_WORKSPACE_DEST_IN_CONTAINER || DEFAULT_CURE_WORKSPACE_CONTAINER).trim()
+    || DEFAULT_CURE_WORKSPACE_CONTAINER;
+  return `${jobDir}:${dest}`;
+}
+
+async function startEphemeralCureJobContainer(requestId) {
+  const name = ephemeralCureContainerName(requestId);
+  if (!name) return false;
+  const imageUrl = await getCureImageUrl();
+  if (!imageUrl) return false;
+  try {
+    const containers = await docker.listContainers({ all: true });
+    const existing = findContainerByName(containers, name);
+    if (existing) {
+      const st = String(existing.State || '').toLowerCase();
+      if (st === 'running' || st === 'created' || st === 'restarting') return true;
+      const old = docker.getContainer(existing.Id);
+      await old.remove({ force: true }).catch(() => {});
+    }
+    const pulled = await pullManagedImage(imageUrl, false, 'cure');
+    if (!pulled) return false;
+    const hostConfig = {
+      NetworkMode: getConfigNetwork(),
+      RestartPolicy: { Name: 'no' },
+      LogConfig: LOG_CONFIG_JSON_FILE,
+      AutoRemove: true,
+    };
+    const jobBind = await resolveEphemeralJobWorkspaceBind(requestId);
+    const fallbackBind = jobBind ? null : await resolveCureWorkspaceBindString();
+    if (jobBind) {
+      hostConfig.Binds = [jobBind];
+      console.log(`📁 [CURE-EPHEMERAL] per-job workspace bind: ${jobBind}`);
+    } else if (fallbackBind) {
+      hostConfig.Binds = [fallbackBind];
+      console.log(`📁 [CURE-EPHEMERAL] shared workspace bind (set host CURE_WORKSPACE_BIND for per-job dirs): ${fallbackBind}`);
+    } else {
+      console.log('📁 [CURE-EPHEMERAL] no workspace bind (repos under image /workspace)');
+    }
+
+    const container = await docker.createContainer({
+      Image: imageUrl,
+      name,
+      Env: getCureServiceEnvWithOneShot(requestId),
+      HostConfig: hostConfig,
+    });
+    await container.start();
+    console.log(`✅ [CURE-EPHEMERAL] started ${name} (one job, AutoRemove)`);
+    return true;
+  } catch (e) {
+    console.warn(`⚠️ [CURE-EPHEMERAL] start failed for ${name}: ${e.message}`);
+    return false;
+  }
+}
+
+async function runEphemeralCureDispatcher() {
+  if (!isCureEphemeralEnabled() || !isCureServiceEnabled()) return;
+  const tok = String(ENGINE_TOKEN || '').trim();
+  if (!tok) return;
+  const adminBase = resolveCureAdminApiBaseUrl();
+  const headers = { Authorization: `Bearer ${tok}` };
+  try {
+    const stats = await axios.get(`${adminBase}/api/admin/cure/runner/queue-stats`, {
+      params: { agent_id: RUNNER_ID },
+      headers,
+      timeout: 15000,
+    });
+    if (stats.data?.cure_activity_locked || stats.data?.cure_service_paused) return;
+    const cc = Number(stats.data?.claimable_count || 0);
+    if (cc <= 0 || stats.data?.active_request_id) return;
+    const peek = await axios.get(`${adminBase}/api/admin/cure/runner/fifo-peek`, {
+      params: { agent_id: RUNNER_ID },
+      headers,
+      timeout: 15000,
+    });
+    const head = String(peek.data?.head_request_id || '').trim();
+    if (!head) return;
+    const name = ephemeralCureContainerName(head);
+    if (!name) return;
+    const containers = await docker.listContainers({ all: true });
+    const existing = findContainerByName(containers, name);
+    if (existing) {
+      const st = String(existing.State || '').toLowerCase();
+      if (st === 'running' || st === 'created' || st === 'paused' || st === 'restarting') return;
+    }
+    await startEphemeralCureJobContainer(head);
+  } catch (e) {
+    const status = e.response?.status;
+    if (status === 401 || status === 403) {
+      console.warn(`⚠️ [CURE-EPHEMERAL] admin-api auth failed (${status}). ENGINE_TOKEN must be a docker-engine runner token allowed on admin cure routes.`);
+      return;
+    }
+    console.warn(`⚠️ [CURE-EPHEMERAL] dispatch: ${e.message}`);
+  }
+}
 
 // Log driver that supports reading (docker logs). Required so we can read container logs
 // when a container exits; daemon default may be journald/awslogs which don't support reading.
@@ -1761,7 +1913,7 @@ async function resolveCureWorkspaceBindString() {
 
 async function checkCureServiceImageAndRestartIfUpdated() {
   try {
-    if (!isCureServiceEnabled()) return false;
+    if (!isCureServiceEnabled() || isCureEphemeralEnabled()) return false;
     const containerName = getCureServiceContainerName();
     const containers = await docker.listContainers({ all: true });
     const existing = findContainerByName(containers, containerName);
@@ -1982,7 +2134,12 @@ async function evaluateManagedImages() {
     services['aionqa-ai-service'] = { status: 'skipped', detail: 'Managed AI container not used (cloud/balance or disabled)' };
   }
 
-  if (isCureServiceEnabled()) {
+  if (isCureEphemeralEnabled()) {
+    services['aionqa-cure'] = {
+      status: 'ephemeral',
+      detail: 'CURE_EPHEMERAL: per-request cure-<request_id> containers (no singleton metrics here)',
+    };
+  } else if (isCureServiceEnabled()) {
     try {
       const cureName = getCureServiceContainerName();
       const containers = await docker.listContainers({ all: true });
@@ -2181,6 +2338,7 @@ function logStartupConfigSnapshot(source = 'api') {
       runner_id: RUNNER_ID,
       max_concurrent_jobs: c.max_concurrent_jobs ?? null,
       poll_interval: c.poll_interval ?? POLL_INTERVAL,
+      cure_ephemeral: isCureEphemeralEnabled(),
       ai_service_enabled: c.ai_service_enabled ?? true,
       ollama_enabled: c.ollama_enabled ?? true,
       ai_service_provider: c.ai_service_provider || 'ollama',
@@ -2507,7 +2665,12 @@ async function reconcileServices() {
     } else {
       await stopAndRemoveAIServiceContainer();
     }
-    if (isCureServiceEnabled()) {
+    if (isCureEphemeralEnabled()) {
+      await stopAndRemoveCureServiceContainer();
+      console.log(
+        'ℹ️ [RECONCILE] CURE_EPHEMERAL=1: no long-lived aionqa-cure container; shared helper spawns cure-<request_id> when admin-api queue has claimable work.',
+      );
+    } else if (isCureServiceEnabled()) {
       await startCureServiceContainer(true); // config already fetched above
     } else {
       await stopAndRemoveCureServiceContainer();
@@ -3206,6 +3369,7 @@ async function main() {
     try {
       runPendingContainerActions().catch(() => {});
       runPendingAIRequests().catch(() => {});
+      await runEphemeralCureDispatcher().catch(() => {});
       pollCount++;
       const job = await pollForJobs();
       
