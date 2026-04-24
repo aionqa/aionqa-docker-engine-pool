@@ -111,7 +111,12 @@ function extractHostPathFromCureBind(bindStr) {
 
 function getCureServiceEnvWithOneShot(requestId) {
   const env = getCureServiceEnv();
-  return [...env, 'CURE_ONE_SHOT=1', `CURE_CLAIM_REQUEST_ID=${String(requestId).trim()}`];
+  return [
+    ...env,
+    'CURE_AUTONOMOUS_CLAIMS=0',
+    'CURE_ONE_SHOT=1',
+    `CURE_CLAIM_REQUEST_ID=${String(requestId).trim()}`,
+  ];
 }
 
 async function resolveEphemeralJobWorkspaceBind(requestId) {
@@ -197,7 +202,22 @@ async function runEphemeralCureDispatcher() {
     });
     if (stats.data?.cure_activity_locked || stats.data?.cure_service_paused) return;
     const cc = Number(stats.data?.claimable_count || 0);
-    if (cc <= 0 || stats.data?.active_request_id) return;
+    if (cc <= 0) return;
+
+    const containers = await docker.listContainers({ all: true });
+    const activeId = String(stats.data?.active_request_id || '').trim();
+    if (activeId) {
+      const activeName = ephemeralCureContainerName(activeId);
+      if (activeName) {
+        const ext = findContainerByName(containers, activeName);
+        const st = ext ? String(ext.State || '').toLowerCase() : '';
+        if (ext && ['running', 'created', 'paused', 'restarting'].includes(st)) return;
+      }
+      const sing = findContainerByName(containers, getCureServiceContainerName());
+      const singSt = sing ? String(sing.State || '').toLowerCase() : '';
+      if (sing && singSt === 'running') return;
+    }
+
     const peek = await axios.get(`${adminBase}/api/admin/cure/runner/fifo-peek`, {
       params: { agent_id: RUNNER_ID },
       headers,
@@ -207,7 +227,6 @@ async function runEphemeralCureDispatcher() {
     if (!head) return;
     const name = ephemeralCureContainerName(head);
     if (!name) return;
-    const containers = await docker.listContainers({ all: true });
     const existing = findContainerByName(containers, name);
     if (existing) {
       const st = String(existing.State || '').toLowerCase();
@@ -1841,7 +1860,7 @@ async function recreateContainerFromExisting(existingId, newImageUrl, containerN
     // Cure must not inherit stale Env or binds from an old container (e.g. missing CURE_ENGINE_ID, wrong /app workspace).
     if (label === 'cure') {
       await fetchHelperConfig();
-      createOpts.Env = getCureServiceEnv();
+      createOpts.Env = [...getCureServiceEnv(), 'CURE_AUTONOMOUS_CLAIMS=1'];
       const wsBind = await resolveCureWorkspaceBindString();
       if (wsBind) {
         createOpts.HostConfig = createOpts.HostConfig || {};
@@ -2034,7 +2053,7 @@ async function startCureServiceContainer(useCachedConfig = false) {
     const container = await docker.createContainer({
       Image: imageUrl,
       name: containerName,
-      Env: getCureServiceEnv(),
+      Env: [...getCureServiceEnv(), 'CURE_AUTONOMOUS_CLAIMS=1'],
       HostConfig: hostConfig,
     });
     await container.start();
