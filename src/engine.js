@@ -203,7 +203,19 @@ async function startEphemeralCureJobContainer(requestId) {
 }
 
 async function runEphemeralCureDispatcher() {
-  if (!isCureEphemeralEnabled() || !isCureServiceEnabled()) return;
+  if (!isCureEphemeralEnabled()) return;
+  if (!isCureServiceEnabled()) {
+    if (!warnedEphemeralCureServiceDisabled) {
+      warnedEphemeralCureServiceDisabled = true;
+      console.warn(
+        '⚠️ [CURE-EPHEMERAL] dispatch disabled: cure_service_enabled is false in helper config (or CURE_SERVICE_ENABLED=0). ' +
+          'Ephemeral cure still needs this flag on — it only skips the long-lived aionqa-cure container. ' +
+          'Enable Cure for this docker engine in Admin (or set CURE_SERVICE_ENABLED=1). ' +
+          'Shared helpers previously defaulted cure_service_enabled off; re-save engine config or upgrade admin defaults.',
+      );
+    }
+    return;
+  }
   const tok = String(ENGINE_TOKEN || '').trim();
   if (!tok) return;
   const adminBase = resolveConfiguredAdminApiBaseUrl();
@@ -277,6 +289,7 @@ const LOG_CONFIG_JSON_FILE = {
 // Track running containers (containerId -> jobId)
 const runningContainers = new Map();
 let warnedEphemeralCureNoAdminUrl = false;
+let warnedEphemeralCureServiceDisabled = false;
 let helperRestartPendingFromImageUpdate = false;
 let helperPendingImageUrl = null;
 /** Latest registry vs local digest comparison (refreshed on IMAGE_CHECK_INTERVAL_MS). Sent with heartbeats for admin UI. */
@@ -1765,10 +1778,31 @@ function getCureServiceContainerName() {
   return 'aionqa-cure';
 }
 
+/** Shared fleet runner id (must match admin `SHARED_RUNNER_IDS`). */
+const SHARED_DOCKER_ENGINE_RUNNER_ID = 'aionqa-docker-engine-shared';
+
+function isSharedDockerEngineRunnerFromEnv() {
+  const rid = String(process.env.RUNNER_ID || '').trim();
+  const eid = String(process.env.ENGINE_ID || '').trim();
+  return rid === SHARED_DOCKER_ENGINE_RUNNER_ID || eid === SHARED_DOCKER_ENGINE_RUNNER_ID;
+}
+
 function isCureServiceEnabled() {
   if (process.env.CURE_SERVICE_ENABLED === 'true' || process.env.CURE_SERVICE_ENABLED === '1') return true;
   if (process.env.CURE_SERVICE_ENABLED === 'false' || process.env.CURE_SERVICE_ENABLED === '0') return false;
-  if (typeof helperConfig?.cure_service_enabled === 'boolean') return helperConfig.cure_service_enabled;
+  if (typeof helperConfig?.cure_service_enabled === 'boolean') {
+    // Legacy data: shared helper template stored cure_service_enabled=false to mean "no dedicated
+    // long-lived cure VM". Ephemeral cure (CURE_EPHEMERAL=1) must still run; reconcileServices already
+    // avoids starting aionqa-cure when ephemeral is on.
+    if (
+      helperConfig.cure_service_enabled === false
+      && isCureEphemeralEnabled()
+      && isSharedDockerEngineRunnerFromEnv()
+    ) {
+      return true;
+    }
+    return helperConfig.cure_service_enabled;
+  }
   // If not explicitly configured, treat existing container as enabled.
   return true;
 }
@@ -1980,7 +2014,14 @@ async function checkCureServiceImageAndRestartIfUpdated() {
 }
 
 function getCureServiceEnv() {
-  const configuredCureBackendUrl = process.env.CURE_BACKEND_URL;
+  // Keep the same explicit-URL precedence as resolveConfiguredAdminApiBaseUrl() so the helper and cure
+  // containers call the same admin-api host when operators set HELPER_ADMIN_API_URL / ADMIN_API_URL only.
+  const configuredCureBackendUrl = String(
+    process.env.CURE_BACKEND_URL
+      || process.env.HELPER_ADMIN_API_URL
+      || process.env.ADMIN_API_URL
+      || '',
+  ).trim();
   const defaultBackendUrl = process.env.BACKEND_URL || '';
   const backendUrl = configuredCureBackendUrl
     || (defaultBackendUrl.includes('://api.') ? defaultBackendUrl.replace('://api.', '://admin-api.') : defaultBackendUrl)
