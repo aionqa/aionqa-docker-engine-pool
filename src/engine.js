@@ -78,16 +78,30 @@ function isCureEphemeralEnabled() {
   return v === '1' || v === 'true' || v === 'yes';
 }
 
-/** Admin-api base URL for cure runner routes (ENGINE_TOKEN / SERVICE_TOKEN auth). */
-function resolveCureAdminApiBaseUrl() {
+/**
+ * Admin-api base URL from env — matches getCureServiceEnv() BACKEND_URL rules for the cure container.
+ * Prefer HELPER_ADMIN_API_URL / ADMIN_API_URL / CURE_BACKEND_URL; else if BACKEND_URL is api.* use admin-api.*;
+ * else use BACKEND_URL as-is (docker compose service URL, internal hostname, etc.).
+ * @returns {string|null} no trailing slash, or null when BACKEND_URL is unset/empty.
+ */
+function resolveConfiguredAdminApiBaseUrl() {
   const explicit = String(
-    process.env.HELPER_ADMIN_API_URL || process.env.ADMIN_API_URL || process.env.CURE_BACKEND_URL || '',
+    process.env.HELPER_ADMIN_API_URL
+      || process.env.ADMIN_API_URL
+      || process.env.CURE_BACKEND_URL
+      || '',
   ).trim();
   if (explicit) return explicit.replace(/\/$/, '');
-  const def = String(BACKEND_URL || '');
-  if (def.includes('://api.')) return def.replace('://api.', '://admin-api.').replace(/\/$/, '');
-  return 'https://admin-api.aionqa.com';
+  const def = String(BACKEND_URL || '').trim().replace(/\/$/, '');
+  if (!def) return null;
+  if (def.includes('://api.')) return def.replace('://api.', '://admin-api.');
+  return def;
 }
+
+console.log(
+  `🩺 Cure queue admin-api: ${resolveConfiguredAdminApiBaseUrl() || "(not configured)"} ` +
+    `(CURE_EPHEMERAL=${isCureEphemeralEnabled() ? "on" : "off"} — set HELPER_ADMIN_API_URL / ADMIN_API_URL / CURE_BACKEND_URL / BACKEND_URL; CURE_EPHEMERAL=1 for per-request cure-<request_id>)`,
+);
 
 function ephemeralCureContainerName(requestId) {
   const id = String(requestId || '')
@@ -192,7 +206,17 @@ async function runEphemeralCureDispatcher() {
   if (!isCureEphemeralEnabled() || !isCureServiceEnabled()) return;
   const tok = String(ENGINE_TOKEN || '').trim();
   if (!tok) return;
-  const adminBase = resolveCureAdminApiBaseUrl();
+  const adminBase = resolveConfiguredAdminApiBaseUrl();
+  if (!adminBase) {
+    if (!warnedEphemeralCureNoAdminUrl) {
+      warnedEphemeralCureNoAdminUrl = true;
+      console.warn(
+        '⚠️ [CURE-EPHEMERAL] admin-api base URL is not configured; ephemeral cure dispatch is disabled. ' +
+          'Set HELPER_ADMIN_API_URL, ADMIN_API_URL, CURE_BACKEND_URL, or BACKEND_URL.',
+      );
+    }
+    return;
+  }
   const headers = { Authorization: `Bearer ${tok}` };
   try {
     const stats = await axios.get(`${adminBase}/api/admin/cure/runner/queue-stats`, {
@@ -252,6 +276,7 @@ const LOG_CONFIG_JSON_FILE = {
 
 // Track running containers (containerId -> jobId)
 const runningContainers = new Map();
+let warnedEphemeralCureNoAdminUrl = false;
 let helperRestartPendingFromImageUpdate = false;
 let helperPendingImageUrl = null;
 /** Latest registry vs local digest comparison (refreshed on IMAGE_CHECK_INTERVAL_MS). Sent with heartbeats for admin UI. */
@@ -1799,16 +1824,7 @@ async function pullManagedImage(imageUrl, forcePull = false, label = 'service') 
 
 /** Base URL for admin-api (cure queue). Helper uses SERVICE_TOKEN to call bulk replan after cure image redeploy. */
 function resolveAdminApiBaseUrlForCureReplan() {
-  const direct = String(
-    process.env.HELPER_ADMIN_API_URL
-      || process.env.ADMIN_API_URL
-      || process.env.CURE_BACKEND_URL
-      || ''
-  ).trim();
-  if (direct) return direct.replace(/\/$/, '');
-  const b = String(process.env.BACKEND_URL || '').trim();
-  if (b.includes('://api.')) return b.replace('://api.', '://admin-api.').replace(/\/$/, '');
-  return '';
+  return resolveConfiguredAdminApiBaseUrl() || '';
 }
 
 /**
@@ -1968,7 +1984,7 @@ function getCureServiceEnv() {
   const defaultBackendUrl = process.env.BACKEND_URL || '';
   const backendUrl = configuredCureBackendUrl
     || (defaultBackendUrl.includes('://api.') ? defaultBackendUrl.replace('://api.', '://admin-api.') : defaultBackendUrl)
-    || 'https://admin-api.aionqa.com';
+    || '';
   const backendKind = process.env.CURE_BACKEND_KIND || 'admin';
   const adminToken = process.env.ADMIN_TOKEN || helperConfig?.cure_admin_token || '';
   const authMode = process.env.CURE_AUTH_MODE || (adminToken ? 'admin' : 'runner');
