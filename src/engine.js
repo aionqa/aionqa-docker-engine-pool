@@ -74,8 +74,9 @@ const docker = new Docker({ socketPath: DOCKER_SOCKET });
 const DEFAULT_CURE_WORKSPACE_CONTAINER = '/workspace';
 
 function isCureEphemeralEnabled() {
-  const v = String(process.env.CURE_EPHEMERAL || '').trim().toLowerCase();
-  return v === '1' || v === 'true' || v === 'yes';
+  // Cure is no longer a singleton managed service. The helper always serves cure
+  // work by spawning one cure-<request_id> container for the FIFO head request.
+  return true;
 }
 
 /**
@@ -100,7 +101,7 @@ function resolveConfiguredAdminApiBaseUrl() {
 
 console.log(
   `🩺 Cure queue admin-api: ${resolveConfiguredAdminApiBaseUrl() || "(not configured)"} ` +
-    `(CURE_EPHEMERAL=${isCureEphemeralEnabled() ? "on" : "off"} — set HELPER_ADMIN_API_URL / ADMIN_API_URL / CURE_BACKEND_URL / BACKEND_URL; CURE_EPHEMERAL=1 for per-request cure-<request_id>)`,
+    `(per-request cure containers; set HELPER_ADMIN_API_URL / ADMIN_API_URL / CURE_BACKEND_URL / BACKEND_URL)`,
 );
 
 function ephemeralCureContainerName(requestId) {
@@ -216,7 +217,14 @@ async function runEphemeralCureDispatcher() {
     }
     return;
   }
-  const tok = String(ENGINE_TOKEN || '').trim();
+  const tok = String(
+    process.env.CURE_DISPATCH_TOKEN
+      || process.env.ADMIN_TOKEN
+      || helperConfig?.cure_admin_token
+      || process.env.SERVICE_TOKEN
+      || ENGINE_TOKEN
+      || '',
+  ).trim();
   if (!tok) return;
   const adminBase = resolveConfiguredAdminApiBaseUrl();
   if (!adminBase) {
@@ -272,7 +280,10 @@ async function runEphemeralCureDispatcher() {
   } catch (e) {
     const status = e.response?.status;
     if (status === 401 || status === 403) {
-      console.warn(`⚠️ [CURE-EPHEMERAL] admin-api auth failed (${status}). ENGINE_TOKEN must be a docker-engine runner token allowed on admin cure routes.`);
+      console.warn(
+        `⚠️ [CURE-EPHEMERAL] admin-api auth failed (${status}). ` +
+          'Set CURE_DISPATCH_TOKEN / ADMIN_TOKEN / SERVICE_TOKEN, or configure cure_admin_token for this helper.',
+      );
       return;
     }
     console.warn(`⚠️ [CURE-EPHEMERAL] dispatch: ${e.message}`);
@@ -1778,32 +1789,19 @@ function getCureServiceContainerName() {
   return 'aionqa-cure';
 }
 
-/** Shared fleet runner id (must match admin `SHARED_RUNNER_IDS`). */
-const SHARED_DOCKER_ENGINE_RUNNER_ID = 'aionqa-docker-engine-shared';
-
-function isSharedDockerEngineRunnerFromEnv() {
-  const rid = String(process.env.RUNNER_ID || '').trim();
-  const eid = String(process.env.ENGINE_ID || '').trim();
-  return rid === SHARED_DOCKER_ENGINE_RUNNER_ID || eid === SHARED_DOCKER_ENGINE_RUNNER_ID;
-}
-
 function isCureServiceEnabled() {
   if (process.env.CURE_SERVICE_ENABLED === 'true' || process.env.CURE_SERVICE_ENABLED === '1') return true;
   if (process.env.CURE_SERVICE_ENABLED === 'false' || process.env.CURE_SERVICE_ENABLED === '0') return false;
   if (typeof helperConfig?.cure_service_enabled === 'boolean') {
-    // Legacy data: shared helper template stored cure_service_enabled=false to mean "no dedicated
-    // long-lived cure VM". Ephemeral cure (CURE_EPHEMERAL=1) must still run; reconcileServices already
-    // avoids starting aionqa-cure when ephemeral is on.
-    if (
-      helperConfig.cure_service_enabled === false
-      && isCureEphemeralEnabled()
-      && isSharedDockerEngineRunnerFromEnv()
-    ) {
+    // Legacy data: some helper records used cure_service_enabled=false to mean
+    // "do not run a long-lived cure service". Per-request cure containers are
+    // the only supported mode now, so that legacy false must not block dispatch.
+    if (helperConfig.cure_service_enabled === false && isCureEphemeralEnabled()) {
       return true;
     }
     return helperConfig.cure_service_enabled;
   }
-  // If not explicitly configured, treat existing container as enabled.
+  // If not explicitly configured, allow per-request cure dispatch.
   return true;
 }
 
@@ -2075,51 +2073,11 @@ async function stopAndRemoveCureServiceContainer() {
 
 async function startCureServiceContainer(useCachedConfig = false) {
   if (!useCachedConfig) await fetchHelperConfig();
-  if (!isCureServiceEnabled()) return false;
-
-  const containerName = getCureServiceContainerName();
-  const imageUrl = await getCureImageUrl();
-  if (!imageUrl) return false;
-
-  try {
-    const containers = await docker.listContainers({ all: true });
-    const existing = findContainerByName(containers, containerName);
-    if (existing && existing.State === 'running') return true;
-    if (existing) {
-      const oldContainer = docker.getContainer(existing.Id);
-      await oldContainer.stop({ t: 10 }).catch(() => {});
-      await oldContainer.remove({ force: true }).catch(() => {});
-    }
-
-    const pulled = await pullManagedImage(imageUrl, true, 'cure');
-    if (!pulled) return false;
-
-    const hostConfig = {
-      NetworkMode: getConfigNetwork(),
-      RestartPolicy: { Name: 'unless-stopped' },
-      LogConfig: LOG_CONFIG_JSON_FILE,
-    };
-    const workspaceBind = await resolveCureWorkspaceBindString();
-    if (workspaceBind) {
-      hostConfig.Binds = [workspaceBind];
-      console.log(`📁 Cure workspace bind: ${workspaceBind} → CURSOR_WORKSPACE_ROOT=${process.env.CURE_WORKSPACE_ROOT || process.env.CURSOR_WORKSPACE_ROOT || DEFAULT_CURE_WORKSPACE_CONTAINER}`);
-    } else {
-      console.log('📁 Cure workspace: no host bind (clone or image layout: repos should live under CURSOR_WORKSPACE_ROOT, default /workspace)');
-    }
-
-    const container = await docker.createContainer({
-      Image: imageUrl,
-      name: containerName,
-      Env: [...getCureServiceEnv(), 'CURE_AUTONOMOUS_CLAIMS=1'],
-      HostConfig: hostConfig,
-    });
-    await container.start();
-    console.log(`✅ Cure service container started: ${containerName} using ${imageUrl}`);
-    return true;
-  } catch (error) {
-    console.warn(`⚠️ Failed to start cure service container: ${error.message}`);
-    return false;
-  }
+  await stopAndRemoveCureServiceContainer();
+  console.log(
+    '⏭️ Cure singleton service is disabled: helper deploys one cure-<request_id> container per FIFO request.',
+  );
+  return false;
 }
 
 /**
@@ -2213,7 +2171,7 @@ async function evaluateManagedImages() {
   if (isCureEphemeralEnabled()) {
     services['aionqa-cure'] = {
       status: 'ephemeral',
-      detail: 'CURE_EPHEMERAL: per-request cure-<request_id> containers (no singleton metrics here)',
+      detail: 'Per-request cure-<request_id> containers only (no singleton service metrics here)',
     };
   } else if (isCureServiceEnabled()) {
     try {
@@ -2744,7 +2702,7 @@ async function reconcileServices() {
     if (isCureEphemeralEnabled()) {
       await stopAndRemoveCureServiceContainer();
       console.log(
-        'ℹ️ [RECONCILE] CURE_EPHEMERAL=1: no long-lived aionqa-cure container; shared helper spawns cure-<request_id> when admin-api queue has claimable work.',
+        'ℹ️ [RECONCILE] Cure runs only as per-request cure-<request_id> containers; no long-lived aionqa-cure service.',
       );
     } else if (isCureServiceEnabled()) {
       await startCureServiceContainer(true); // config already fetched above
