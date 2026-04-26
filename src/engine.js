@@ -170,7 +170,7 @@ async function startEphemeralCureJobContainer(requestId) {
     }
     const pulled = await pullManagedImage(imageUrl, false, 'cure');
     if (!pulled) return false;
-    const hostConfig = {
+    let hostConfig = {
       NetworkMode: getConfigNetwork(),
       RestartPolicy: { Name: 'no' },
       LogConfig: LOG_CONFIG_JSON_FILE,
@@ -186,6 +186,12 @@ async function startEphemeralCureJobContainer(requestId) {
       console.log(`📁 [CURE-EPHEMERAL] shared workspace bind (set host CURE_WORKSPACE_BIND for per-job dirs): ${fallbackBind}`);
     } else {
       console.log('📁 [CURE-EPHEMERAL] no workspace bind (repos under image /workspace)');
+    }
+
+    const sockBind = cureDockerSocketBindForCureService();
+    if (sockBind) {
+      hostConfig = mergeCureHostConfigBinds(hostConfig, sockBind);
+      console.log(`🐳 [CURE-EPHEMERAL] docker socket bind for same-host runner access: ${sockBind}`);
     }
 
     const container = await docker.createContainer({
@@ -1916,9 +1922,13 @@ async function recreateContainerFromExisting(existingId, newImageUrl, containerN
       await fetchHelperConfig();
       createOpts.Env = [...getCureServiceEnv(), 'CURE_AUTONOMOUS_CLAIMS=1'];
       const wsBind = await resolveCureWorkspaceBindString();
+      createOpts.HostConfig = createOpts.HostConfig || {};
       if (wsBind) {
-        createOpts.HostConfig = createOpts.HostConfig || {};
         createOpts.HostConfig.Binds = [wsBind];
+      }
+      const sockBind = cureDockerSocketBindForCureService();
+      if (sockBind) {
+        createOpts.HostConfig = mergeCureHostConfigBinds(createOpts.HostConfig, sockBind);
       }
     }
     if (inspectData?.State?.Running) {
@@ -2017,6 +2027,25 @@ async function checkCureServiceImageAndRestartIfUpdated() {
   }
 }
 
+/** When CURE_SAME_DOCKER_AS_RUNNERS=1, bind the Docker socket into cure so the agent can run docker logs/ps. */
+function cureDockerSocketBindForCureService() {
+  if (!/^(1|true|yes|on)$/i.test(String(process.env.CURE_SAME_DOCKER_AS_RUNNERS || '').trim())) {
+    return null;
+  }
+  const p = String(process.env.CURE_DOCKER_SOCKET_PATH || '/var/run/docker.sock').trim() || '/var/run/docker.sock';
+  return `${p}:${p}`;
+}
+
+function mergeCureHostConfigBinds(hostConfig, extraBind) {
+  if (!extraBind) return hostConfig || {};
+  const hc = hostConfig && typeof hostConfig === 'object' ? { ...hostConfig } : {};
+  const prev = Array.isArray(hc.Binds) ? [...hc.Binds] : [];
+  const has = prev.some((b) => String(b).includes('docker.sock'));
+  if (!has) prev.push(extraBind);
+  hc.Binds = prev;
+  return hc;
+}
+
 function getCureServiceEnv() {
   // Keep the same explicit-URL precedence as resolveConfiguredAdminApiBaseUrl() so the helper and cure
   // containers call the same admin-api host when operators set HELPER_ADMIN_API_URL / ADMIN_API_URL only.
@@ -2058,6 +2087,11 @@ function getCureServiceEnv() {
     // GitHub HTTPS clones (prefetch + repo sync): PAT from host or rely on admin-api CURE_GITHUB_TOKEN → runtime.secrets.
     `GITHUB_TOKEN=${process.env.GITHUB_TOKEN || ''}`,
     `GH_TOKEN=${process.env.GH_TOKEN || ''}`,
+    // When cure shares the host with the helper and crawler job containers, pass through so
+    // aionqa-cure can set payload.cure_infrastructure and use the mounted Docker socket.
+    `CURE_SAME_DOCKER_AS_RUNNERS=${process.env.CURE_SAME_DOCKER_AS_RUNNERS || ''}`,
+    `CURE_DOCKER_SOCKET_PATH=${process.env.CURE_DOCKER_SOCKET_PATH || '/var/run/docker.sock'}`,
+    `CURE_DOCKER_COMPOSE_NETWORK_HINT=${process.env.CURE_DOCKER_COMPOSE_NETWORK_HINT || ''}`,
   ];
 }
 
