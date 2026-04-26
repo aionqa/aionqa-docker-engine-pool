@@ -1129,6 +1129,12 @@ async function pollForJobs() {
       console.log(`   Image: ${response.data.job.image_url || 'unknown'}`);
       return response.data.job;
     }
+    if (response.data && response.data.at_capacity) {
+      console.log(
+        `[POLL] Helper at capacity (running=${response.data.running ?? '?'} max=${response.data.max_concurrent_jobs ?? '?'}); will retry`,
+      );
+      return null;
+    }
     if (response.data && response.data.job === null) {
       return null;
     }
