@@ -1,68 +1,80 @@
-# Docker Engine Pool
+# AionQA Helper (Docker Engine Pool)
 
-A lightweight Docker engine manager that connects to the AionQA backend and manages remote Docker containers for crawling jobs.
+`aionqa-docker-engine-pool` is the helper service that manages crawler containers on a Docker host.
 
-## Overview
+It is responsible for:
 
-This service allows you to run crawling jobs on remote Docker engines instead of ECS or local Docker. The engine:
+1. Registering a Docker engine with backend
+2. Sending engine heartbeats and metrics
+3. Polling for assigned jobs
+4. Starting/stopping crawler containers
+5. Reporting job lifecycle back to backend
+6. Running helper-managed maintenance/update actions
 
-1. Connects to the backend and registers itself
-2. Polls for jobs assigned to it
-3. Starts Docker containers with the crawler image
-4. Monitors container lifecycle
-5. Reports status back to the backend
+## Requirements
 
-## Configuration
+- Node.js 20+ (if running outside Docker)
+- Docker daemon access (`/var/run/docker.sock`)
+- Valid `ENGINE_TOKEN` from AionQA admin/UI
 
-### Environment Variables
-
-- `BACKEND_URL` - Backend API URL (default: `http://back:4000`)
-- `ENGINE_TOKEN` - Authentication token (required, generate in UI)
-- `ENGINE_ID` - Unique engine identifier (auto-generated if not provided)
-- `RUNNER_NAME` - Optional. If set, crawler containers are named `aionqa-crawler-runner-{name}` (sanitized) so the helper can start a container with a specific name and replace any existing one. Useful for one-runner-per-slot setups.
-- `POLL_INTERVAL` - Poll interval in milliseconds (default: 5000)
-- `DOCKER_SOCKET` - Docker socket path (default: `/var/run/docker.sock`)
-
-**Self-update (no extra env required):** When an update is requested, the app pulls the new image and then recreates the container automatically. It discovers the compose project from the container’s own labels (`com.docker.compose.project.working_dir`) when run via Docker Compose, and runs `docker compose up -d --force-recreate`. If not run via Compose, it uses the Docker API to create and start a new container from the new image (same config) and exits so the old container stops. Optional: `COMPOSE_PROJECT_DIR` and `COMPOSE_FILE` override auto-discovery.
-
-### Running
+## Quick Start (Local)
 
 ```bash
 npm install
+```
+
+PowerShell example:
+
+```powershell
+$env:ENGINE_TOKEN="your-engine-token"
+$env:BACKEND_URL="https://api.aionqa.com"
+$env:POLL_INTERVAL="5000"
 npm start
 ```
 
-### Docker
-
-The engine needs access to the Docker daemon. Run with:
+## Quick Start (Docker)
 
 ```bash
+docker build -t aionqa-helper .
 docker run -d \
-  --name docker-engine-pool \
+  --name aionqa-helper \
   -v /var/run/docker.sock:/var/run/docker.sock \
+  -e ENGINE_TOKEN=your-engine-token \
   -e BACKEND_URL=https://api.aionqa.com \
-  -e ENGINE_TOKEN=your_token_here \
-  docker-engine-pool:latest
+  -e POLL_INTERVAL=5000 \
+  aionqa-helper
 ```
 
-## Architecture
+## Configuration
 
-```
-Backend (Job Queue)
-  ↑ Register / Heartbeat
-Docker Engine Pool
-  ↑ Poll for Jobs
-  ↓ Start Container
-Docker Container (Crawler)
-  ↑ Connect to Backend
-  ↓ Execute Job
-```
+### Required
 
-The engine is stateless and can be scaled horizontally. Each engine polls for jobs assigned to it and manages its own containers.
+- `ENGINE_TOKEN`: auth token for register/poll/heartbeat/job reporting
 
+### Common Optional
 
+- `BACKEND_URL`: backend base URL (default: `https://api.aionqa.com`)
+- `ENGINE_ID`: explicit engine identifier (auto-generated if omitted)
+- `RUNNER_ID`: runner identifier used in logs/metrics (defaults to `ENGINE_ID`)
+- `RUNNER_NAME`: if set, crawler containers use deterministic names (`aionqa-crawler-runner-{name}`)
+- `POLL_INTERVAL`: job polling interval in milliseconds (default: `5000`)
+- `DOCKER_SOCKET`: Docker socket path (default: `/var/run/docker.sock`)
+- `IMAGE_CHECK_INTERVAL_MS`: managed image version check interval (default: `30000`)
 
+### Advanced / Integration
 
+- `SERVICE_KEY`: optional key used for backend image URL retrieval when enabled
+- `HELPER_CONTAINER_NAME`, `HELPER_IMAGE`: override helper self-reference metadata
+- `CURE_*`, `ADMIN_*`, `AI_SERVICE_*`, `OLLAMA_*`: optional feature toggles/integration overrides for cure/AI/container orchestration workflows
 
+## Operational Notes
 
+- The service is stateless and horizontally scalable.
+- Each helper handles only jobs assigned to its engine ID/token scope.
+- Self-update flows can pull new managed images and recreate containers when configured by backend.
 
+## NPM Scripts
+
+- `npm start` - start helper engine manager
+- `npm run dev` - watch mode
+- `npm test` - run Node test files in `src/*.test.js`
