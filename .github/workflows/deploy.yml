@@ -1,9 +1,7 @@
 name: Deploy Docker Engine Pool (Helper)
 
+# AionQA is shut down; deployments must be started manually.
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
 
 env:
